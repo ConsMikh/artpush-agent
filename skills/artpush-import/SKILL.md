@@ -90,11 +90,13 @@ artpush import discard 41 --apply pv_…       # только после «да�
 
 ```sh
 artpush artnow check https://artnow.ru/…          # проверить ссылку на страницу художника
-artpush artnow start https://artnow.ru/… --catalog "Artnow" --origin personal
+artpush artnow start https://artnow.ru/… --origin personal
 artpush artnow works 52 --table                   # прочитанные работы
 artpush artnow create 52 --apply pv_…             # после показа разбора и «да»
 ```
 
+- «Artnow» к работам импорта добавляется сам — `--catalog "Artnow"` не нужен. Разложить работы по
+  своим каталогам — на шаге «Разбор» в браузере; либо `--catalog <каталог>` для всех работ сразу.
 - `artnow start` читает работы (может идти долго), затем печатает разбор с жетоном — дальше как с папкой:
   показать, спросить, `artnow create … --apply`.
 - Чтение остановилось (`crawl_stopped`) — `artpush artnow resume 52`; ушло по таймауту —

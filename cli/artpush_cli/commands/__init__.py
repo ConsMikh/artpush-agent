@@ -107,6 +107,48 @@ class Context:
             choices=[entry["name"] for entry in entries],
         )
 
+    def resolve_catalog(self, value: str) -> int:
+        """id каталога: номер, либо путь «А / Б» или имя без учёта регистра по дереву каталогов.
+
+        Путь может начинаться с имени верхнего каталога или без него. Нет ни одного —
+        catalog_not_found, несколько — catalog_ambiguous со списком полных путей."""
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+        catalogs = self.get("/api/catalogs")
+        by_id = {c["id"]: c for c in catalogs}
+
+        def path(catalog: dict) -> list[str]:
+            names = [catalog["name"]]
+            while catalog.get("parent_id") in by_id:
+                catalog = by_id[catalog["parent_id"]]
+                names.append(catalog["name"])
+            return names[::-1]
+
+        wanted = [part.strip().casefold() for part in text.split("/") if part.strip()]
+        found = []
+        for catalog in catalogs:
+            names = path(catalog)
+            folded = [name.casefold() for name in names]
+            if wanted and folded[len(folded) - len(wanted) :] == wanted:
+                found.append((catalog["id"], names, folded == wanted))
+        exact = [item for item in found if item[2]] if len(wanted) > 1 else []
+        if len(exact) == 1:
+            return exact[0][0]
+        if len(found) == 1:
+            return found[0][0]
+        if found:
+            raise CommandError(
+                f"Каталогов «{value}» несколько — укажите путь или номер",
+                "catalog_ambiguous",
+                choices=[" / ".join(names) for _, names, _ in found],
+            )
+        raise CommandError(
+            f"Каталог «{value}» не найден — создайте его (catalog add) или укажите --new-catalog",
+            "catalog_not_found",
+            choices=[" / ".join(path(c)) for c in catalogs],
+        )
+
     def close(self) -> None:
         if self._client is not None:
             self._client.close()

@@ -55,7 +55,10 @@ irm https://raw.githubusercontent.com/ConsMikh/artpush-agent/main/install.ps1 | 
 словами.
 
 1. **Определи ОС** человека.
-2. **Выполни команду установки сам** (ключ не нужен):
+2. **Выполни команду установки сам** (ключ не нужен). Если клиент модели блокирует установщик
+   (например, защита Claude Code в автоматическом режиме не пускает `curl … | sh` или `irm … | iex`) —
+   не обходи блокировку: покажи человеку команду и попроси выполнить её в своём окне терминала, затем
+   продолжи с шага 3:
    - macOS и Linux:
      ```sh
      curl -fsSL https://raw.githubusercontent.com/ConsMikh/artpush-agent/main/install.sh | sh

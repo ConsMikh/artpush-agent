@@ -86,9 +86,27 @@ def _free_name(folder: Path, name: str, media_id: int) -> Path:
     return candidate
 
 
+def _list(args, ctx: Context) -> None:
+    rows = [
+        {
+            "id": m["id"],
+            "kind": m.get("kind"),
+            "is_main": m.get("is_main", False),
+            "filename": m.get("original_name"),
+            "status": m.get("processing_status"),
+        }
+        for m in ctx.painting(args.id).get("media", [])
+    ]
+    emit(rows, table=ctx.table)
+
+
 def _download(args, ctx: Context) -> None:
     media = ctx.painting(args.id).get("media", [])
-    if args.media is not None:
+    if args.main:
+        media = [m for m in media if m.get("is_main")]
+        if not media:
+            raise UsageError(f"У картины {args.id} нет главного медиа")
+    elif args.media is not None:
         media = [m for m in media if m["id"] == args.media]
         if not media:
             raise UsageError(f"У картины {args.id} нет медиа {args.media}")
@@ -155,11 +173,16 @@ def register(subparsers, parents: list) -> None:
     download = command(media, "download", "Скачать оригиналы или миниатюры", parents)
     download.add_argument("id", type=int, help="номер картины")
     which = download.add_mutually_exclusive_group(required=True)
+    which.add_argument("--main", action="store_true", help="главное медиа")
     which.add_argument("--media", type=int, help="номер медиа")
     which.add_argument("--all", action="store_true", help="все медиа картины")
     download.add_argument("--thumbnail", action="store_true", help="миниатюры вместо оригиналов")
     download.add_argument("--to", required=True, help="папка назначения")
     download.set_defaults(handler=_download, mutates=None)
+
+    listing = command(media, "list", "Медиа картины: номер, вид, главное, файл, состояние", parents)
+    listing.add_argument("id", type=int, help="номер картины")
+    listing.set_defaults(handler=_list, mutates=None)
 
     order = command(media, "order", "Задать порядок медиа", parents)
     order.add_argument("id", type=int, help="номер картины")
