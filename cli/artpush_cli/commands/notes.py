@@ -16,6 +16,15 @@ def _add(args, ctx: Context) -> None:
     emit(ctx.send("POST", f"/api/paintings/{args.id}/notes", json=body), table=ctx.table)
 
 
+def _edit(args, ctx: Context) -> None:
+    path = f"/api/paintings/{args.id}/notes/{args.note_id}"
+    emit(ctx.send("PATCH", path, json={"text": args.text}), table=ctx.table)
+
+
+def _delete(args, ctx: Context) -> None:
+    emit(ctx.send("DELETE", f"/api/paintings/{args.id}/notes/{args.note_id}"), table=ctx.table)
+
+
 def _history(args, ctx: Context) -> None:
     out = ctx.get(f"/api/paintings/{args.id}/history")
     emit(out["items"] if ctx.table else out, table=ctx.table)
@@ -52,6 +61,16 @@ def register(subparsers, parents: list) -> None:
     add.add_argument("id", type=int, help="номер картины")
     add.add_argument("text", help="текст заметки")
     add.set_defaults(handler=_add, mutates=lambda a: True)
+
+    edit = command(notes, "edit", "Изменить свою заметку", parents)
+    edit.add_argument("id", type=int, help="номер картины")
+    edit.add_argument("note_id", type=int, help="номер заметки")
+    edit.add_argument("text", help="новый текст")
+    edit.set_defaults(handler=_edit, mutates=lambda a: True)
+    delete = command(notes, "delete", "Удалить свою заметку", parents)
+    delete.add_argument("id", type=int, help="номер картины")
+    delete.add_argument("note_id", type=int, help="номер заметки")
+    delete.set_defaults(handler=_delete, mutates=lambda a: True)
 
     history = command(subparsers, "history", "История картины", parents)
     history.add_argument("id", type=int, help="номер картины")

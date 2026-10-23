@@ -71,26 +71,6 @@ def scan(folder: Path) -> list[tuple[str, Path, int]]:
 # --- общие данные пачки -----------------------------------------------------------------------
 
 
-def _catalog_id(ctx: Context, value: str) -> int:
-    """Каталог по имени (без учёта регистра) или по номеру."""
-    catalogs = ctx.get("/api/catalogs")
-    wanted = value.strip().casefold()
-    named = [c["id"] for c in catalogs if c["name"].casefold() == wanted]
-    if len(named) > 1:
-        raise CommandError(
-            f"Каталогов «{value}» несколько — укажите номер", "catalog_ambiguous", ids=named
-        )
-    if named:
-        return named[0]
-    if wanted.isdigit() and any(c["id"] == int(wanted) for c in catalogs):
-        return int(wanted)
-    raise CommandError(
-        f"Каталог «{value}» не найден — создайте его (catalog add) или укажите --new-catalog",
-        "catalog_not_found",
-        choices=[c["name"] for c in catalogs],
-    )
-
-
 def batch(args, ctx: Context) -> dict:
     """Общие данные пачки: флаги, иначе умолчания из настроек пользователя."""
     defaults = (ctx.get("/api/me").get("settings") or {}) if _needs_settings(args) else {}
@@ -104,7 +84,7 @@ def batch(args, ctx: Context) -> dict:
         value = getattr(args, kind)
         body[f"{kind}_id"] = ctx.resolve(kind, value) if value else defaults.get(f"default_{kind}")
     body["tags"] = args.tag
-    body["catalog_ids"] = [_catalog_id(ctx, value) for value in args.catalog]
+    body["catalog_ids"] = [ctx.resolve_catalog(value) for value in args.catalog]
     body["new_catalog"] = args.new_catalog
     return body
 

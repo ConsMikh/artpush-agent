@@ -1,9 +1,24 @@
 """Картины: поиск, карточка, правка полей, тексты, цены, удаление, производная."""
 
+import io
+import json
+import re
+import zipfile
+from pathlib import Path
+
 from artpush_cli import versions
 from artpush_cli.client import ApiError
-from artpush_cli.commands import DICT_FIELDS, Context, UsageError, command, group, split
-from artpush_cli.output import emit
+from artpush_cli.commands import (
+    DICT_FIELDS,
+    CommandError,
+    Context,
+    UsageError,
+    command,
+    group,
+    ids,
+    split,
+)
+from artpush_cli.output import emit, err
 
 OVERWRITE_HELP = (
     "после конфликта (409): записать поверх чужой правки с текущей версией, "
@@ -142,8 +157,10 @@ def _search(args, ctx: Context) -> None:
         params.append(("year_min", str(year_min)))
     if year_max is not None:
         params.append(("year_max", str(year_max)))
+    if args.note:
+        params.append(("note", args.note))
     if args.catalog is not None:
-        params.append(("catalog", str(args.catalog)))
+        params.append(("catalog", str(ctx.resolve_catalog(args.catalog))))
     text_lang = None
     if args.missing and args.missing.startswith("text:"):
         text_lang = args.missing.removeprefix("text:")
@@ -172,7 +189,56 @@ def _search(args, ctx: Context) -> None:
     if ctx.table:
         emit(items, table=True, columns=["id", "title", "year", "technique", "status", "missing"])
     else:
-        emit({"items": items, "total": total})
+        result = {"items": items, "total": total}
+        if args.thumbs:
+            result["thumbs"] = _fetch_thumbs(ctx, [row["id"] for row in items], args.thumbs)
+        emit(result)
+
+
+THUMBS_BATCH = 100
+
+
+def _fetch_thumbs(ctx: Context, painting_ids: list[int], folder: str) -> dict:
+    """Миниатюры для диалога (chat.jpg главных изображений) пачками по 100 в DIR/<номер>.jpg."""
+    target = Path(folder)
+    target.mkdir(parents=True, exist_ok=True)
+    files: list[str] = []
+    missing: dict[str, str] = {}
+    for start in range(0, len(painting_ids), THUMBS_BATCH):
+        batch = ",".join(str(i) for i in painting_ids[start : start + THUMBS_BATCH])
+        response = ctx.client().request("GET", "/api/media/chat-thumbs", params={"ids": batch})
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(response.content))
+        except zipfile.BadZipFile:
+            raise CommandError("Система вернула не архив миниатюр", "thumbs_bad_archive") from None
+        with archive:
+            for name in archive.namelist():
+                if name == "missing.json":
+                    try:
+                        found = json.loads(archive.read(name))
+                    except ValueError:
+                        found = None
+                    if not isinstance(found, dict):
+                        raise CommandError(
+                            "В архиве миниатюр испорчен missing.json", "thumbs_bad_archive"
+                        )
+                    missing.update(found)
+                elif re.fullmatch(r"\d+\.jpg", name):
+                    path = target / f"{int(name[:-4])}.jpg"
+                    path.write_bytes(archive.read(name))
+                    files.append(str(path))
+                else:
+                    err(f"Предупреждение: из архива пропущен файл с недопустимым именем «{name}»")
+    return {"files": files, "missing": missing}
+
+
+def _thumbs(args, ctx: Context) -> None:
+    emit(_fetch_thumbs(ctx, args.ids, args.to), table=ctx.table)
+
+
+def _placements(args, ctx: Context) -> None:
+    items = ctx.get(f"/api/paintings/{args.id}/placements")["items"]
+    emit(items, table=ctx.table, columns=["gallery_title", "url", "section", "published_at"])
 
 
 def _missing_text(ctx: Context, rows: list[dict], spec: str, enough: int):
@@ -303,7 +369,9 @@ def register(subparsers, parents: list) -> None:
     search.add_argument("--year", type=int, help="год (точно)")
     search.add_argument("--year-min", type=int)
     search.add_argument("--year-max", type=int)
-    search.add_argument("--catalog", type=int, help="номер каталога")
+    search.add_argument("--catalog", help="каталог: имя, путь «А / Б» или номер")
+    search.add_argument("--note", help="слова из текста заметок")
+    search.add_argument("--thumbs", metavar="DIR", help="скачать миниатюры найденных в DIR")
     search.add_argument("--tag", action="append", default=[], help="тег (все указанные)")
     search.add_argument("--incomplete", action="store_true", help="только незаполненные")
     search.add_argument(
@@ -317,7 +385,16 @@ def register(subparsers, parents: list) -> None:
     search.add_argument("--offset", type=int, default=0)
     search.set_defaults(handler=_search, mutates=None)
 
+    thumbs = command(listing, "thumbs", "Миниатюры картин для диалога (DIR/<номер>.jpg)", parents)
+    thumbs.add_argument("ids", type=ids, help="номера картин через запятую")
+    thumbs.add_argument("--to", required=True, help="папка назначения")
+    thumbs.set_defaults(handler=_thumbs, mutates=None)
+
     one = group(subparsers, "painting", "Одна картина: карточка и правка")
+    placements = command(one, "placements", "Где картина размещена (площадки)", parents)
+    placements.add_argument("id", type=int)
+    placements.set_defaults(handler=_placements, mutates=None)
+
     get = command(one, "get", "Карточка картины", parents)
     get.add_argument("id", type=int)
     get.add_argument("--with", dest="with_", help=f"добавить: {','.join(WITH_PARTS)}")

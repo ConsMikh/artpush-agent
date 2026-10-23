@@ -21,11 +21,13 @@ from artpush_cli.commands import (
     artnow,
     bulk,
     catalogs,
+    dictionaries,
     imports,
     media,
     notes,
     paintings,
     raw,
+    report,
     system,
     trash,
 )
@@ -42,11 +44,13 @@ COMMAND_MODULES = [
     media,
     catalogs,
     notes,
+    dictionaries,
     trash,
     bulk,
     imports,
     artnow,
     admin,
+    report,
 ]
 
 # Поля ответа 409 о конфликте версий, которые попадают в JSON ошибки.
@@ -116,7 +120,7 @@ def _check_contract(args, ctx: Context) -> None:
         client = ctx.client()
         client.check_contract()
         system_version = system.release_version(client.contract().get("system_version") or "")
-        if system_version and system_version != __version__:
+        if system_version and system.version_key(system_version) < system.version_key(__version__):
             err(
                 f"Предупреждение: набор {__version__}, система {system_version}"
                 " — выполните artpush update"

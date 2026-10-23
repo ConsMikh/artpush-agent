@@ -2,6 +2,7 @@
 
 import getpass
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -56,7 +57,30 @@ def _whoami(args, ctx: Context) -> None:
 
 
 def _contract(args, ctx: Context) -> None:
-    emit(ctx.client().contract(), table=ctx.table)
+    contract = ctx.client().contract()
+    if args.op:
+        found = next((op for op in contract.get("operations", []) if op["id"] == args.op), None)
+        if found is None:
+            raise CommandError(f"Операции «{args.op}» нет в контракте", "operation_not_found")
+        if ctx.table:
+            emit(found.get("body") or [], table=True, columns=["name", "type", "required"])
+        else:
+            emit(found)
+    elif args.fields:
+        labels = contract.get("field_labels", {})
+        if ctx.table:
+            rows = [{"поле": k, "подпись": v} for k, v in labels.items()]
+            emit(rows, table=True, columns=["поле", "подпись"])
+        else:
+            emit(labels)
+    else:
+        emit(contract, table=ctx.table)
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    """Числа версии для сравнения: «v0.8.0-dev» → (0, 8, 0)."""
+    numbers = re.match(r"\d+(?:\.\d+)*", release_version(version))
+    return tuple(int(part) for part in numbers.group().split(".")) if numbers else ()
 
 
 def release_version(system_version: str) -> str:
@@ -147,6 +171,8 @@ def register(subparsers, parents: list) -> None:
     whoami.set_defaults(handler=_whoami, mutates=None)
 
     contract = command(subparsers, "contract", "Показать контракт системы", parents)
+    contract.add_argument("--op", help="одна операция с полями тела запроса (по id)")
+    contract.add_argument("--fields", action="store_true", help="подписи полей картины")
     contract.set_defaults(handler=_contract, mutates=None)
 
     update = command(
