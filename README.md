@@ -160,7 +160,8 @@ artpush whoami        # кто я, роль, предел ключа
 | служебные | `init`, `whoami`, `contract`, `update` |
 | поиск и карточка | `paintings search`, `painting get / create / set / text / price / delete / derive` |
 | массовое заполнение | `bulk preview`, `bulk apply`, `bulk undo` |
-| медиа | `media upload / download / order / main / transfer` |
+| медиа | `media upload / download / list / order / main / transfer` |
+| обработка и карточка файла | `media edit` (формат, размер, объём — новые файлы или `--replace`), `media label / note / rename / versions / restore` (окончательного удаления версий нет — только в браузере) |
 | каталоги | `catalogs tree`, `catalog add / members / delete` |
 | заметки и история | `notes list / add`, `history`, `events add` |
 | корзина | `trash list / restore` (очистки нет — только в браузере) |
