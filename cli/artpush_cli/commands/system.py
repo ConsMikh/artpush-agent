@@ -53,6 +53,8 @@ def _whoami(args, ctx: Context) -> None:
     result = {key: me.get(key) for key in ("username", "display_name", "role")}
     if me.get("agent_scope") is not None:
         result["key_scope"] = me["agent_scope"]
+    if language := (me.get("settings") or {}).get("primary_language"):
+        result["primary_language"] = language  # язык сведений в файле у media edit
     emit(result, table=ctx.table)
 
 

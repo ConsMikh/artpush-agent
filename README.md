@@ -161,7 +161,7 @@ artpush whoami        # кто я, роль, предел ключа
 | поиск и карточка | `paintings search`, `painting get / create / set / text / price / delete / derive` |
 | массовое заполнение | `bulk preview`, `bulk apply`, `bulk undo` |
 | медиа | `media upload / download / list / order / main / transfer` |
-| обработка и карточка файла | `media edit` (формат, размер, объём, цвет — новые файлы или `--replace`), `media label / note / rename / versions / restore` (окончательного удаления версий нет — только в браузере) |
+| обработка и карточка файла | `media edit` (формат, размер, объём, цвет, выравнивание, тон, поля, подпись, сведения — новые файлы или `--replace`), `media label / note / rename / versions / restore` (окончательного удаления версий нет — только в браузере) |
 | каталоги | `catalogs tree`, `catalog add / members / delete` |
 | заметки и история | `notes list / add`, `history`, `events add` |
 | корзина | `trash list / restore` (очистки нет — только в браузере) |
@@ -184,7 +184,14 @@ artpush whoami        # кто я, роль, предел ключа
 | `--pdf-image` | `jpeg` (по умолчанию), `lossless` — только у PDF (`--format pdf` или исходный PDF) |
 | `--profile` | `screen` (sRGB, по умолчанию), `print` (ClayRGB, по охвату как Adobe RGB (1998)), `cmyk` (ISO Coated v2; только `jpeg`, `tiff`, `pdf`), `keep` |
 | размер | `--long-side`, `--size-px`, `--size-cm` с `--dpi`, `--fit`, `--pad-color` |
-| геометрия, данные | `--rotate`, `--flip`, `--keep-exif` |
+| геометрия | `--rotate`, `--flip` |
+| выравнивание | `--perspective auto` (найти углы и эскиз в `~/.cache/artpush/edit-<id>-corners.jpg`, ничего не сохраняет, код 3) или `--perspective x1,y1,…,x4,y4` (углы ВЛ, ВП, НП, НЛ в долях) с `--ratio card\|corners`; `--tilt` — наклон от −15 до 15° |
+| тон и цвет | `--white-balance auto`, `--temperature`, `--tint`, `--brightness`, `--contrast`, `--saturation` (−100…100), `--sharpness` (0…100) |
+| поля | `--border PCT`, `--border-sides T,R,B,L`, `--border-ratio W:H` (одно из трёх), `--border-extra`, `--border-color` (`white`, `black`, `#rrggbb`) |
+| подпись | `--caption "ШАБЛОН"`, `--caption-place`, `--caption-size`, `--caption-color`; без `--caption` подписи нет |
+| сведения в файле | `--meta-title`, `--meta-description`, `--meta-keywords`, `--meta-author`, `--meta-rights`, `--meta-url`, `--meta-created` (`""` — не записывать, без флага — из карточки), `--meta-lang` (по умолчанию — `primary_language` из `whoami`), `--keep-camera` (прежний `--keep-exif`), `--keep-date` |
+
+Правка одних сведений у JPEG и WebP сохраняет файл без пересжатия (`passthrough` в плане).
 
 На вход принимаются фото JPEG, PNG, TIFF, WebP, HEIC, AVIF, RAW камер (DNG, CR2, CR3, NEF, ARW, ORF, RAF,
 RW2, PEF) и PSD — `media upload` и `import folder` отправляют их как есть.

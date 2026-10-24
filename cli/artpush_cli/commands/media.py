@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 
+from artpush_cli import client as client_mod
 from artpush_cli.client import ApiError
 from artpush_cli.commands import (
     EXIT_ERROR,
@@ -228,6 +229,21 @@ TIFF_COMPRESSION = {"lzw": "LZW", "zip": "ZIP", "none": "без сжатия"}
 PDF_IMAGE = {"jpeg": "JPEG", "lossless": "без потерь"}
 SOFT_PROOF = "Цвета CMYK на экране приблизительные; профиль уточните у типографии"  # как ru.ts
 SIZE_RE = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*[xхX×]\s*(\d+(?:[.,]\d+)?)\s*$")
+# Срез 9: выравнивание, тон, поля, подпись, сведения (7.2–7.5).
+CORNERS_REVIEW = "Ничего не изменено: покажите человеку эскиз углов и передайте их числами"
+NO_CARD_SIZE = "В карточке нет размеров — укажите их в карточке или передайте --ratio corners"
+TONE_NAMES = {
+    "temperature": "температура",
+    "tint": "оттенок",
+    "brightness": "яркость",
+    "contrast": "контраст",
+    "saturation": "насыщенность",
+    "sharpness": "резкость",
+}
+COLORS = {"white": "#ffffff", "black": "#000000"}
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+# Поля meta.text рецепта: флаг --meta-<поле>; "" — не записывать, без флага — из карточки.
+META_FIELDS = ("author", "rights", "title", "description", "keywords", "url", "created")
 
 
 def _ask(prompt: str) -> bool:
@@ -250,6 +266,73 @@ def _pair(kind):
         return (int(w), int(h)) if kind is int else (w, h)
 
     return parse
+
+
+def _ranged(kind, low: float, high: float, what: str):
+    """Тип argparse: число kind в пределах [low, high]; what — подсказка «наклон — от …»."""
+
+    def parse(value: str):
+        try:
+            number = kind(value.replace(",", ".")) if kind is float else kind(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{what}: «{value}»") from None
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(f"{what}: «{value}»")
+        return number
+
+    return parse
+
+
+def _perspective(value: str):
+    """auto или 8 долей через запятую — углы ВЛ, ВП, НП, НЛ парами x,y."""
+    if value == "auto":
+        return value
+    try:
+        numbers = [float(part) for part in value.split(",")]
+    except ValueError:
+        numbers = []
+    if len(numbers) != 8 or not all(0 <= n <= 1 for n in numbers):
+        raise argparse.ArgumentTypeError(
+            f"ожидается auto или 8 чисел от 0 до 1 через запятую — x,y углов ВЛ, ВП, НП, НЛ: "
+            f"«{value}»"
+        )
+    return [(numbers[i], numbers[i + 1]) for i in range(0, 8, 2)]
+
+
+def _corners_text(corners) -> str:
+    """Углы одной строкой, готовой для --perspective."""
+    return ",".join(f"{v:.4f}".rstrip("0").rstrip(".") for corner in corners for v in corner)
+
+
+def _sides(value: str) -> list[float]:
+    try:
+        numbers = [float(part) for part in value.split(",")]
+    except ValueError:
+        numbers = []
+    if len(numbers) != 4 or not all(0 <= n <= 50 for n in numbers):
+        raise argparse.ArgumentTypeError(
+            f"ожидается 4 ширины полей от 0 до 50 % через запятую — сверху, справа, снизу, слева: "
+            f"«{value}»"
+        )
+    return numbers
+
+
+def _aspect(value: str) -> list[int]:
+    a, sep, b = value.partition(":")
+    if sep and a.strip().isdigit() and b.strip().isdigit() and int(a) > 0 and int(b) > 0:
+        return [int(a), int(b)]
+    raise argparse.ArgumentTypeError(f"ожидается пропорция Ш:В, например 1:1 или 4:5: «{value}»")
+
+
+def _color(value: str) -> str:
+    color = COLORS.get(value.casefold(), value)
+    if not HEX_RE.match(color):
+        raise argparse.ArgumentTypeError(f"ожидается white, black или #rrggbb: «{value}»")
+    return color.lower()
+
+
+def _signed(value: int) -> str:
+    return f"+{value}" if value > 0 else str(value).replace("-", "−")
 
 
 def _megabytes(value: str) -> float:
@@ -311,6 +394,44 @@ def _check_flags(args) -> None:
         raise UsageError("--quality — от 1 до 100")
     if args.format and (error := _combo_error(args, args.format)):
         raise UsageError(error)
+    _check_correction(args)
+
+
+def _check_correction(args) -> None:
+    """Сочетания флагов выравнивания, тона, полей и подписи (срез 9)."""
+    corners = isinstance(args.perspective, list)
+    if args.perspective is not None and args.tilt is not None:
+        raise UsageError("--perspective и --tilt вместе не применяются — выберите один способ")
+    if corners and len(args.media_ids) > 1:
+        raise UsageError("Углы в --perspective — для одного файла: у каждого снимка они свои")
+    if args.ratio and not corners:
+        raise UsageError("--ratio — только с углами числами в --perspective")
+    if args.white_balance and (args.temperature is not None or args.tint is not None):
+        raise UsageError(
+            "--white-balance auto сам задаёт температуру и оттенок — без --temperature и --tint"
+        )
+    borders = [
+        flag
+        for flag, value in (
+            ("--border", args.border),
+            ("--border-sides", args.border_sides),
+            ("--border-ratio", args.border_ratio),
+        )
+        if value is not None
+    ]
+    if len(borders) > 1:
+        raise UsageError(f"{' и '.join(borders)} вместе не применяются — выберите один вид полей")
+    if args.border_extra is not None and args.border_ratio is None:
+        raise UsageError("--border-extra — только с --border-ratio")
+    if args.border_color and not borders:
+        raise UsageError(
+            "--border-color — только вместе с --border, --border-sides или --border-ratio"
+        )
+    if args.caption is not None and not args.caption.strip():
+        raise UsageError("--caption — шаблон подписи, не пустой; без подписи флаг не нужен")
+    caption_options = (args.caption_place, args.caption_size, args.caption_color)
+    if args.caption is None and any(v is not None for v in caption_options):
+        raise UsageError("--caption-place, --caption-size и --caption-color — только с --caption")
 
 
 def _source_format(card: dict) -> str:
@@ -324,7 +445,69 @@ def _default_format(card: dict) -> str:
     return "jpeg" if pixels > ENCODE_MAX_PIXELS.get(fmt, pixels) else fmt
 
 
-def _recipe(args, card: dict) -> dict:
+def _geometry(args) -> dict:
+    geometry = {}
+    if args.rotate:
+        geometry["rotate"] = args.rotate
+    for side in args.flip or ():
+        geometry[f"flip_{side}"] = True
+    return geometry
+
+
+def _card_ratio(painting: dict) -> float | None:
+    """Пропорция «из карточки» — высота / ширина картины (решение 4); нет размеров — None."""
+    try:
+        w, h = float(painting.get("width_cm") or 0), float(painting.get("height_cm") or 0)
+    except (TypeError, ValueError):
+        return None
+    return h / w if w > 0 and h > 0 else None
+
+
+def _correction(args, recipe: dict, ratio, white_balance, lang) -> None:
+    """Выравнивание, тон, поля с подписью и сведения — только заданное флагами."""
+    if isinstance(args.perspective, list):
+        corners = [list(corner) for corner in args.perspective]
+        recipe["straighten"] = {"mode": "corners", "corners": corners, "ratio": ratio}
+    elif args.tilt is not None:
+        recipe["straighten"] = {"mode": "tilt", "tilt": args.tilt}
+    tone = dict(white_balance or {})
+    tone.update({k: getattr(args, k) for k in TONE_NAMES if getattr(args, k) is not None})
+    if tone:
+        recipe["tone"] = tone
+    frame: dict = {}
+    if args.border is not None:
+        frame = {"mode": "around", "around": args.border}
+    elif args.border_sides is not None:
+        frame = {"mode": "sides", "sides": args.border_sides}
+    elif args.border_ratio is not None:
+        frame = {"mode": "ratio", "ratio": args.border_ratio}
+        if args.border_extra is not None:
+            frame["extra"] = args.border_extra
+    if args.border_color:
+        frame["color"] = args.border_color
+    if args.caption is not None:
+        caption = {"template": args.caption}
+        for key in ("place", "size", "color"):
+            if (value := getattr(args, f"caption_{key}")) is not None:
+                caption[key] = value
+        frame["caption"] = caption
+    if frame:
+        recipe["frame"] = frame
+    meta: dict = {}
+    if lang:
+        meta["lang"] = lang
+    if args.keep_exif:
+        meta["keep_shooting"] = True
+    if args.keep_date is not None:  # без флага — как --keep-camera
+        meta["keep_date"] = args.keep_date
+    text = {k: v for k in META_FIELDS if (v := getattr(args, f"meta_{k}")) is not None}
+    if text:
+        meta["text"] = text
+    if meta:
+        recipe["meta"] = meta
+
+
+def _recipe(args, card: dict, *, ratio=None, white_balance=None, lang=None) -> dict:
     """Рецепт обработки файла из флагов и его карточки; не заданное — по умолчанию сервера.
 
     Формат и качество по умолчанию — по исходному, как в редакторе: формат исходного, если система
@@ -336,11 +519,7 @@ def _recipe(args, card: dict) -> dict:
     fmt = args.format or _default_format(card)
     if error := _combo_error(args, fmt):
         raise CommandError(error, "bad_recipe")
-    geometry = {}
-    if args.rotate:
-        geometry["rotate"] = args.rotate
-    for side in args.flip or ():
-        geometry[f"flip_{side}"] = True
+    geometry = _geometry(args)
     size: dict = {"mode": "keep"}
     if args.long_side:
         size = {"mode": "long", "long_px": args.long_side}
@@ -372,8 +551,7 @@ def _recipe(args, card: dict) -> dict:
         recipe["geometry"] = geometry
     if args.profile:
         recipe["color"] = {"profile": PROFILES[args.profile]}
-    if args.keep_exif:
-        recipe["meta"] = {"keep_shooting": True}
+    _correction(args, recipe, ratio, white_balance, lang)
     return recipe
 
 
@@ -402,6 +580,33 @@ def _planned_name(args, file: str, fmt: str) -> str:
     return f"{base}.{EXTS[fmt]}"
 
 
+def _ratio_text(r: float) -> str:
+    """Ширина : высота малыми числами — как в редакторе (ratioText): 0,75 → «3 : 4»."""
+    for b in range(1, 17):
+        a = round(r * b)
+        if 1 <= a <= 16 and abs(a / b - r) / r < 0.015:
+            return f"{a} : {b}"
+    return f"{round(r, 2):g}".replace(".", ",") + " : 1"
+
+
+def _straighten_note(recipe: dict, report: dict) -> str:
+    """Выравнивание словами описания файла: строка сервера из steps предпросмотра, иначе своя
+    тем же языком; у углов — откуда пропорция. Без выравнивания — пусто."""
+    st = recipe.get("straighten") or {}
+    mode = st.get("mode")
+    if mode not in ("corners", "tilt"):
+        return ""
+    prefix = "выровнено по углам" if mode == "corners" else "наклон"
+    step = next((s for s in report.get("steps") or [] if s.startswith(prefix)), "")
+    if mode == "tilt":
+        tilt = st.get("tilt") or 0
+        text = f"{tilt:g}".replace(".", ",").replace("-", "−")
+        return step or (f"наклон {text}°" if tilt else "")
+    ratio = st.get("ratio")
+    source = f"из карточки {_ratio_text(1 / ratio)}" if ratio else "по углам"
+    return f"{step or prefix}, пропорция {source}"
+
+
 def _plan_row(args, item: dict) -> dict:
     report = item["report"]
     fmt = item["recipe"]["encode"]["format"]
@@ -413,6 +618,23 @@ def _plan_row(args, item: dict) -> dict:
     if report.get("soft_proof") and SOFT_PROOF not in warnings:
         warnings.append(SOFT_PROOF)
     setting = {k: report[k] for k in ("tiff_compression", "pdf_image") if report.get(k)}
+    tone = item["recipe"].get("tone", {})
+    framed = report.get("framed_from")
+    straighten = _straighten_note(item["recipe"], report)
+    notes = [straighten] if straighten else []
+    if tone:
+        notes.append(
+            "тон: "
+            + ", ".join(
+                f"{TONE_NAMES[k]} {v if k == 'sharpness' else _signed(v)}" for k, v in tone.items()
+            )
+        )
+    if report.get("caption"):
+        notes.append(f"подпись «{report['caption']}»")
+    if framed:
+        notes.append(f"поля увеличили размер: {framed[0]} × {framed[1]} → {w} × {h}")
+    if report.get("passthrough"):
+        notes.append("изменены только сведения — без пересжатия")
     return {
         "media_id": item["media_id"],
         "file": item["file"],
@@ -425,6 +647,13 @@ def _plan_row(args, item: dict) -> dict:
         "soft_proof": bool(report.get("soft_proof")),
         "volume": _volume(report.get("size", report.get("size_estimate")), not exact),
         "warnings": warnings,
+        "straighten": straighten,
+        "tone": tone,
+        "caption": report.get("caption") or "",
+        "framed_from": framed,
+        "passthrough": bool(report.get("passthrough")),
+        "metadata": report.get("metadata") or [],
+        "notes": notes,
         "unmet": bool(report.get("unmet")),
         "upscale_needed": bool(report.get("upscale_needed")),
         "blocked": item.get("blocked", ""),
@@ -446,12 +675,14 @@ def _print_plan(rows: list[dict]) -> None:
             f"{row['file']} (медиа {row['media_id']}, картина {row['painting_id']}): "
             f"{row['result']}, {encode}, {row['volume']} → {row['name']}"
         )
+        if row["notes"]:
+            line += "; " + "; ".join(row["notes"])
         err(line + (f" — {warnings}" if warnings else ""))
         if row["blocked"]:
             err(f"  нельзя без решения человека: {row['blocked']}")
 
 
-def _prepare(args, ctx: Context, item: dict) -> None:
+def _prepare(args, ctx: Context, item: dict, lang: str | None = None) -> None:
     """Дополняет item картой файла, рецептом, отчётом предпросмотра и (при --max-mb) пробой.
 
     Ошибка — исключением; имя файла к этому моменту уже в item, если карточка прочитана.
@@ -459,7 +690,16 @@ def _prepare(args, ctx: Context, item: dict) -> None:
     media_id = item["media_id"]
     card = ctx.get(f"/api/media/{media_id}")
     item.update(file=card["original_name"], painting_id=card["painting_id"])
-    recipe = item["recipe"] = _recipe(args, card)
+    ratio = None
+    if isinstance(args.perspective, list) and args.ratio != "corners":
+        ratio = _card_ratio(ctx.painting(card["painting_id"]))
+        if ratio is None and args.ratio == "card":
+            raise CommandError(NO_CARD_SIZE, "bad_recipe")
+    balance = None
+    if args.white_balance:  # серый мир по всему кадру — как пипетка без точки в редакторе
+        found = ctx.send("POST", f"/api/media/{media_id}/edit/white-balance", json={"point": None})
+        balance = {"temperature": found["temperature"], "tint": found["tint"]}
+    recipe = item["recipe"] = _recipe(args, card, ratio=ratio, white_balance=balance, lang=lang)
     report = ctx.send("POST", f"/api/media/{media_id}/preview", json=recipe)["report"]
     item["report"] = report
     if report.get("upscale_needed") and not args.allow_upscale:
@@ -527,17 +767,78 @@ def _summary(done: list, failed: list) -> str:
     return text
 
 
+def _primary_language(ctx: Context) -> str:
+    """Язык сведений по умолчанию — язык человека (whoami = GET /api/me), иначе ru."""
+    me = ctx.get("/api/me")
+    return me.get("primary_language") or (me.get("settings") or {}).get("primary_language") or "ru"
+
+
+def _corners(args, ctx: Context) -> int:
+    """--perspective auto: углы и эскиз каждого файла; ничего не сохраняет (7.7)."""
+    geometry = _geometry(args)
+    folder = client_mod.CACHE_PATH.parent
+    rows, failed = [], []
+    for media_id in args.media_ids:
+        file = ""
+        try:
+            file = ctx.get(f"/api/media/{media_id}")["original_name"]
+            found = ctx.send(
+                "POST", f"/api/media/{media_id}/edit/corners", json={"geometry": geometry}
+            )
+            body = {"geometry": geometry, "corners": found["corners"]}
+            sketch = ctx.client().request(
+                "POST", f"/api/media/{media_id}/edit/corners/sketch", json=body
+            )
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"edit-{media_id}-corners.jpg"
+            path.write_bytes(sketch.content)
+        except ApiError as exc:
+            if exc.status in STOP_UPLOADS:
+                raise
+            failed.append({"media_id": media_id, "file": file, "error": _reason(exc)})
+        except (httpx.TransportError, OSError) as exc:
+            failed.append({"media_id": media_id, "file": file, "error": _reason(exc)})
+        else:
+            numbers = _corners_text(found["corners"])
+            state = (
+                "углы найдены"
+                if found["found"]
+                else "углы не найдены — поставлены по краям снимка, поправьте числа"
+            )
+            err(f"{file} (медиа {media_id}): {state}: --perspective {numbers}; эскиз: {path}")
+            rows.append(
+                {
+                    "media_id": media_id,
+                    "file": file,
+                    "found": bool(found["found"]),
+                    "perspective": numbers,
+                    "sketch": str(path),
+                }
+            )
+    for f in failed:
+        err(f"{f['file'] or f['media_id']}: {f['error']}")
+    if not rows:
+        emit({"corners": [], "failed": failed}, table=ctx.table)
+        return EXIT_ERROR
+    raise CommandError(
+        CORNERS_REVIEW, "decision_required", EXIT_FORBIDDEN, corners=rows, failed=failed
+    )
+
+
 def _edit(args, ctx: Context) -> int:
     if args.name and len(args.media_ids) > 1 and "{name}" not in args.name:
         raise UsageError("Для нескольких файлов --name — шаблон с {name}, иначе имена совпадут")
     if args.name and args.replace:
         raise UsageError("--name не сочетается с --replace: заменённый файл сохраняет имя")
     _check_flags(args)
+    if args.perspective == "auto":
+        return _corners(args, ctx)
+    lang = args.meta_lang or _primary_language(ctx)
     items, failed = [], []
     for media_id in args.media_ids:
         item = {"media_id": media_id, "file": ""}
         try:
-            _prepare(args, ctx, item)
+            _prepare(args, ctx, item, lang)
         except ApiError as exc:
             if exc.status in STOP_UPLOADS:
                 raise
@@ -647,13 +948,15 @@ def _register_edit(media, parents: list) -> None:
     edit = command(
         media,
         "edit",
-        "Обработать изображения: формат, размер, объём, поворот; итог — новые файлы или замена",
+        "Обработать изображения: формат, размер, объём, поворот, выравнивание, тон, поля, "
+        "подпись, сведения; итог — новые файлы или замена",
         parents,
     )
     edit.epilog = (
         "Если хоть один файл требует решения (увеличение без --allow-upscale, объём больше "
         "предела без --accept-unmet), ничего не делается ни с одним файлом: код 3, "
-        "«Ничего не изменено». Подтверждение — ответ «да» строкой в stdin."
+        "«Ничего не изменено». Подтверждение — ответ «да» строкой в stdin. "
+        "--perspective auto ничего не сохраняет: печатает углы и путь к эскизу, код 3."
     )
     edit.add_argument("media_ids", type=ids, help="номера медиафайлов через запятую")
     edit.add_argument(
@@ -711,7 +1014,7 @@ def _register_edit(media, parents: list) -> None:
         action="append",
         help="отразить: h — по горизонтали, v — по вертикали",
     )
-    edit.add_argument("--keep-exif", action="store_true", help="сохранить данные съёмки (EXIF)")
+    _register_correction(edit)
     edit.add_argument(
         "--name",
         default="",
@@ -747,7 +1050,121 @@ def _register_edit(media, parents: list) -> None:
     )
     timeout_argument(edit, EDIT_TIMEOUT, "каждого задания")
     # Отчёт без пробы только читает (предпросмотр — операция чтения): хватает ключа read.
-    edit.set_defaults(handler=_edit, mutates=lambda a: not a.dry_run or bool(a.max_mb))
+    # --perspective auto только читает (углы и эскиз).
+    edit.set_defaults(
+        handler=_edit,
+        mutates=lambda a: a.perspective != "auto" and (not a.dry_run or bool(a.max_mb)),
+    )
+
+
+def _register_correction(edit) -> None:
+    """Флаги среза 9: выравнивание, тон и цвет, поля, подпись, сведения в файле."""
+    edit.add_argument(
+        "--perspective",
+        type=_perspective,
+        metavar="auto|x1,y1,…,x4,y4",
+        help="выровнять по углам картины: auto — найти углы и нарисовать эскиз (ничего не "
+        "сохраняет), или 8 долей кадра — углы ВЛ, ВП, НП, НЛ после --rotate/--flip",
+    )
+    edit.add_argument(
+        "--ratio",
+        choices=("card", "corners"),
+        help="пропорция результата при --perspective: card — из размеров карточки (по умолчанию, "
+        "если они есть), corners — по углам",
+    )
+    edit.add_argument(
+        "--tilt",
+        type=_ranged(float, -15, 15, "наклон — от −15 до 15°"),
+        metavar="DEG",
+        help="выровнять наклоном, градусы (плюс — по часовой), от −15 до 15",
+    )
+    for name, label in list(TONE_NAMES.items())[:5]:
+        edit.add_argument(
+            f"--{name}",
+            type=_ranged(int, -100, 100, f"{label} — от −100 до 100"),
+            metavar="N",
+            help=f"{label}, от −100 до 100",
+        )
+    edit.add_argument(
+        "--sharpness",
+        type=_ranged(int, 0, 100, "резкость — от 0 до 100"),
+        metavar="N",
+        help="резкость, от 0 до 100",
+    )
+    edit.add_argument(
+        "--white-balance",
+        choices=("auto",),
+        help="auto — баланс белого по всему кадру (убрать желтизну); не с --temperature/--tint",
+    )
+    percent = _ranged(float, 0, 50, "ширина поля — от 0 до 50 %")
+    edit.add_argument(
+        "--border", type=percent, metavar="PCT", help="поля вокруг, %% короткой стороны картины"
+    )
+    edit.add_argument(
+        "--border-sides",
+        type=_sides,
+        metavar="T,R,B,L",
+        help="поля по сторонам: сверху, справа, снизу, слева, %% короткой стороны",
+    )
+    edit.add_argument(
+        "--border-ratio",
+        type=_aspect,
+        metavar="W:H",
+        help="поля до пропорции файла, например 1:1 или 4:5; картина не обрезается",
+    )
+    edit.add_argument(
+        "--border-extra",
+        type=percent,
+        metavar="PCT",
+        help="ещё отступ вокруг при --border-ratio, %% короткой стороны",
+    )
+    edit.add_argument("--border-color", type=_color, help="цвет полей: white, black или #rrggbb")
+    edit.add_argument(
+        "--caption",
+        metavar="ШАБЛОН",
+        help="подпись под картиной; поля карточки: {автор}, {название}, {год}, {техника}, "
+        "{материал}, {размер}. Без флага подписи нет",
+    )
+    edit.add_argument("--caption-place", choices=("left", "center", "right"), help="место подписи")
+    edit.add_argument(
+        "--caption-size",
+        type=_ranged(float, 1, 10, "размер подписи — от 1 до 10 % высоты"),
+        metavar="PCT",
+        help="размер подписи, %% высоты (по умолчанию 3)",
+    )
+    edit.add_argument("--caption-color", type=_color, help="цвет подписи: white, black или #rrggbb")
+    for name, label in (
+        ("title", "название"),
+        ("description", "описание"),
+        ("keywords", "ключевые слова через запятую"),
+        ("author", "автор"),
+        ("rights", "права"),
+        ("url", "сайт, контакт"),
+        ("created", "дата создания"),
+    ):
+        edit.add_argument(
+            f"--meta-{name}",
+            metavar="TEXT",
+            help=f'{label} в файле; "" — не записывать; без флага — из карточки',
+        )
+    edit.add_argument(
+        "--meta-lang",
+        metavar="CODE",
+        help="язык текстов в файле и подписи (по умолчанию — primary_language из whoami)",
+    )
+    edit.add_argument(
+        "--keep-camera",
+        "--keep-exif",
+        dest="keep_exif",
+        action="store_true",
+        help="перенести камеру и настройки съёмки из исходного; переносит и дату съёмки, если "
+        "не указан --keep-date/--no-keep-date (GPS не переносится никогда)",
+    )
+    edit.add_argument(
+        "--keep-date",
+        action=argparse.BooleanOptionalAction,
+        help="перенести дату съёмки из исходного; --no-keep-date — без даты при --keep-camera",
+    )
 
 
 def _register_card(media, parents: list) -> None:
