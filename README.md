@@ -161,7 +161,7 @@ artpush whoami        # кто я, роль, предел ключа
 | поиск и карточка | `paintings search`, `painting get / create / set / text / price / delete / derive` |
 | массовое заполнение | `bulk preview`, `bulk apply`, `bulk undo` |
 | медиа | `media upload / download / list / order / main / transfer` |
-| обработка и карточка файла | `media edit` (формат, размер, объём — новые файлы или `--replace`), `media label / note / rename / versions / restore` (окончательного удаления версий нет — только в браузере) |
+| обработка и карточка файла | `media edit` (формат, размер, объём, цвет — новые файлы или `--replace`), `media label / note / rename / versions / restore` (окончательного удаления версий нет — только в браузере) |
 | каталоги | `catalogs tree`, `catalog add / members / delete` |
 | заметки и история | `notes list / add`, `history`, `events add` |
 | корзина | `trash list / restore` (очистки нет — только в браузере) |
@@ -169,6 +169,25 @@ artpush whoami        # кто я, роль, предел ключа
 | Artnow | `artnow check / start / resume / wait / stop / works / create` |
 | администрирование | `admin dicts / journal / integrity / keys / users` |
 | прочее | `call <METHOD> <путь>` — сырой вызов операции из контракта |
+
+### Обработка: `media edit`
+
+Делает то же, что редактор в браузере. Без `--format` формат — как у исходного (RAW, PSD, HEIC и AVIF больше 40 Мпикс — JPEG),
+качество — исходного того же формата, иначе JPEG/WebP/PDF 90, AVIF 75, HEIC 80.
+
+| Флаг | Значения |
+|---|---|
+| `--format` | `jpeg`, `png`, `tiff`, `webp`, `avif`, `heic`, `pdf` |
+| `--quality` | 1–100 у `jpeg`, `webp`, `avif`, `heic` и `pdf` с JPEG |
+| `--max-mb` | предел объёма (проба сжатия, качество подбирает она — не вместе с `--quality`); без флага объём не ограничен |
+| `--tiff-compression` | `lzw` (по умолчанию), `zip`, `none` — только у TIFF (`--format tiff` или исходный TIFF) |
+| `--pdf-image` | `jpeg` (по умолчанию), `lossless` — только у PDF (`--format pdf` или исходный PDF) |
+| `--profile` | `screen` (sRGB, по умолчанию), `print` (ClayRGB, по охвату как Adobe RGB (1998)), `cmyk` (ISO Coated v2; только `jpeg`, `tiff`, `pdf`), `keep` |
+| размер | `--long-side`, `--size-px`, `--size-cm` с `--dpi`, `--fit`, `--pad-color` |
+| геометрия, данные | `--rotate`, `--flip`, `--keep-exif` |
+
+На вход принимаются фото JPEG, PNG, TIFF, WebP, HEIC, AVIF, RAW камер (DNG, CR2, CR3, NEF, ARW, ORF, RAF,
+RW2, PEF) и PSD — `media upload` и `import folder` отправляют их как есть.
 
 ## Подтверждение человеком
 

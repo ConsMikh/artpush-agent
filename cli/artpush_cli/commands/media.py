@@ -100,6 +100,7 @@ def _list(args, ctx: Context) -> None:
             "kind": m.get("kind"),
             "is_main": m.get("is_main", False),
             "filename": m.get("original_name"),
+            "format": m.get("format_label") or m.get("format") or "",
             "status": m.get("processing_status"),
         }
         for m in ctx.painting(args.id).get("media", [])
@@ -180,7 +181,52 @@ MB = 1024 * 1024  # «МБ» — как в браузере: 1 МБ = 1 048 576 
 EDIT_TIMEOUT = 600  # секунд на задание (проба, новый файл, замена)
 NOTHING_CHANGED = "Ничего не изменено"
 YES = {"да", "д", "yes", "y"}
-EXTS = {"jpeg": "jpg", "png": "png", "tiff": "tif", "webp": "webp"}  # как у сервера
+# Расширение и подпись формата результата — как у сервера и редактора (client/.../editor/recipe.ts).
+EXTS = {
+    "jpeg": "jpg",
+    "png": "png",
+    "tiff": "tif",
+    "webp": "webp",
+    "avif": "avif",
+    "heic": "heic",
+    "pdf": "pdf",
+}
+FORMAT_LABELS = {
+    "jpeg": "JPEG",
+    "png": "PNG",
+    "tiff": "TIFF",
+    "webp": "WebP",
+    "avif": "AVIF",
+    "heic": "HEIC",
+    "pdf": "PDF",
+}
+# Формат результата по коду формата исходного (MediaOut.format); RAW, PSD и прочих нет — у них JPEG.
+SOURCE_FORMAT = {
+    "JPEG": "jpeg",
+    "PNG": "png",
+    "TIFF": "tiff",
+    "WEBP": "webp",
+    "AVIF": "avif",
+    "HEIF": "heic",
+    "PDF": "pdf",
+}
+# Качество по умолчанию, если оно не взято у исходного того же формата (6а.1).
+DEFAULT_QUALITY = {"jpeg": 90, "webp": 90, "avif": 75, "heic": 80, "pdf": 90}
+# Предел кодера HEIC и AVIF в пикселях — как ENCODE_MAX_PIXELS в
+# server/artpush/catalog/format_limits.py: исходный больше него по умолчанию идёт в JPEG.
+ENCODE_MAX_PIXELS = {"avif": 40_000_000, "heic": 40_000_000}
+QUALITY_WITH_MAX_MB = (
+    "--quality не сочетается с --max-mb: при пределе объёма качество подбирает проба — "
+    "оставьте один из флагов"
+)
+CMYK_FORMATS = ("jpeg", "tiff", "pdf")
+CMYK_ONLY = "Печать CMYK — только для JPEG, TIFF и PDF"
+# Флаг --profile → color.profile рецепта.
+PROFILES = {"screen": "screen", "print": "print", "cmyk": "print_cmyk", "keep": "keep"}
+# Настройка формата словами — как во вкладке «Формат» редактора.
+TIFF_COMPRESSION = {"lzw": "LZW", "zip": "ZIP", "none": "без сжатия"}
+PDF_IMAGE = {"jpeg": "JPEG", "lossless": "без потерь"}
+SOFT_PROOF = "Цвета CMYK на экране приблизительные; профиль уточните у типографии"  # как ru.ts
 SIZE_RE = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*[xхX×]\s*(\d+(?:[.,]\d+)?)\s*$")
 
 
@@ -228,12 +274,68 @@ def _num(value) -> str:
     return f"{value:.1f}".rstrip("0").rstrip(".").replace(".", ",")
 
 
-def _recipe(args) -> dict:
-    """Рецепт обработки из флагов; не заданное — по умолчанию сервера.
+def _lossy(fmt: str, pdf_image: str | None) -> bool:
+    """Сжатие с потерями: есть качество и его подбор под объём (PDF — по изображению внутри)."""
+    return fmt in ("jpeg", "webp", "avif", "heic") or (fmt == "pdf" and pdf_image != "lossless")
 
+
+def _combo_error(args, fmt: str) -> str:
+    """Флаги, которые не подходят к формату результата; пусто — подходят."""
+    if args.tiff_compression and fmt != "tiff":
+        return (
+            f"--tiff-compression — только у TIFF, а результат — {FORMAT_LABELS[fmt]}; "
+            "добавьте --format tiff"
+        )
+    if args.pdf_image and fmt != "pdf":
+        return (
+            f"--pdf-image — только у PDF, а результат — {FORMAT_LABELS[fmt]}; добавьте --format pdf"
+        )
+    if args.profile == "cmyk" and fmt not in CMYK_FORMATS:
+        return f"{CMYK_ONLY} (формат результата — {FORMAT_LABELS[fmt]})"
+    if args.quality is not None and not _lossy(fmt, args.pdf_image):
+        return (
+            f"--quality — только у jpeg, webp, avif, heic и pdf с JPEG, не у {FORMAT_LABELS[fmt]}"
+        )
+    return ""
+
+
+def _check_flags(args) -> None:
+    """Проверка флагов до запросов к серверу при явном --format.
+
+    Без --format формат — у исходного каждого файла: сочетание проверяет _recipe, и неподходящий
+    файл не делается, а остальные идут.
+    """
+    if args.quality is not None and args.max_mb:
+        raise UsageError(QUALITY_WITH_MAX_MB)
+    if args.quality is not None and not 1 <= args.quality <= 100:
+        raise UsageError("--quality — от 1 до 100")
+    if args.format and (error := _combo_error(args, args.format)):
+        raise UsageError(error)
+
+
+def _source_format(card: dict) -> str:
+    return SOURCE_FORMAT.get(card.get("format") or "JPEG", "jpeg")
+
+
+def _default_format(card: dict) -> str:
+    """Формат исходного, если его кодер берёт такой размер (HEIC 48 Мпикс — нет), иначе JPEG."""
+    fmt = _source_format(card)
+    pixels = (card.get("width") or 0) * (card.get("height") or 0)
+    return "jpeg" if pixels > ENCODE_MAX_PIXELS.get(fmt, pixels) else fmt
+
+
+def _recipe(args, card: dict) -> dict:
+    """Рецепт обработки файла из флагов и его карточки; не заданное — по умолчанию сервера.
+
+    Формат и качество по умолчанию — по исходному, как в редакторе: формат исходного, если система
+    его пишет (RAW, PSD, HEIC и AVIF больше 40 Мпикс — JPEG); качество исходного того же формата,
+    если известно, иначе DEFAULT_QUALITY.
     Увеличение в рецепте всегда «спросить»: так предпросмотр честно показывает, что оно нужно,
     а решение человека (--allow-upscale) уходит флагом allow_upscale задания.
     """
+    fmt = args.format or _default_format(card)
+    if error := _combo_error(args, fmt):
+        raise CommandError(error, "bad_recipe")
     geometry = {}
     if args.rotate:
         geometry["rotate"] = args.rotate
@@ -253,16 +355,23 @@ def _recipe(args) -> dict:
     if args.pad_color:
         size["pad_color"] = args.pad_color
     size["upscale"] = "ask"
-    encode: dict = {"format": args.format}
+    encode: dict = {"format": fmt}
     if args.max_mb:
         encode.update(mode="max_bytes", max_bytes=round(args.max_mb * MB))
-    elif args.quality:
-        encode.update(mode="quality", quality=args.quality)
+    else:
+        encode["mode"] = "quality"
+        if _lossy(fmt, args.pdf_image):
+            known = card.get("quality") if _source_format(card) == fmt else None
+            encode["quality"] = args.quality or known or DEFAULT_QUALITY[fmt]
+    if args.tiff_compression:
+        encode["tiff_compression"] = args.tiff_compression
+    if args.pdf_image:
+        encode["pdf_image"] = args.pdf_image
     recipe: dict = {"size": size, "encode": encode}
     if geometry:
         recipe["geometry"] = geometry
     if args.profile:
-        recipe["color"] = {"profile": args.profile}
+        recipe["color"] = {"profile": PROFILES[args.profile]}
     if args.keep_exif:
         recipe["meta"] = {"keep_shooting": True}
     return recipe
@@ -283,30 +392,39 @@ def _wait_edit(ctx: Context, edit: dict, timeout: float) -> dict:
     return edit
 
 
-def _planned_name(args, file: str) -> str:
+def _planned_name(args, file: str, fmt: str) -> str:
     """Имя результата, как его даст сервер; номер <n> по умолчанию сервер выберет сам."""
     stem = Path(file).stem
     if args.replace:
         base = stem
     else:
         base = _name(args.name, file) if args.name else f"{stem}-<n>"
-    return f"{base}.{EXTS[args.format]}"
+    return f"{base}.{EXTS[fmt]}"
 
 
 def _plan_row(args, item: dict) -> dict:
     report = item["report"]
+    fmt = item["recipe"]["encode"]["format"]
+    label = report.get("format") or FORMAT_LABELS[fmt]  # у сервера — подпись: «HEIC», «WebP»
     w, h = report["width"], report["height"]
     cm = report.get("cm") or [None, None]
     exact = "size" in report  # у пробы — точный объём, у предпросмотра — оценка
+    warnings = list(report.get("warnings", []))
+    if report.get("soft_proof") and SOFT_PROOF not in warnings:
+        warnings.append(SOFT_PROOF)
+    setting = {k: report[k] for k in ("tiff_compression", "pdf_image") if report.get(k)}
     return {
         "media_id": item["media_id"],
         "file": item["file"],
         "painting_id": item["painting_id"],
-        "name": _planned_name(args, item["file"]),
+        "name": _planned_name(args, item["file"], fmt),
         "result": f"{w}×{h} px, {_num(cm[0])}×{_num(cm[1])} см, {report.get('dpi')} dpi",
-        "encode": f"{report.get('format', '')} {report.get('quality') or ''}".strip(),
+        "encode": f"{label} {report.get('quality') or ''}".strip(),
+        **setting,
+        "profile": report.get("profile", ""),
+        "soft_proof": bool(report.get("soft_proof")),
         "volume": _volume(report.get("size", report.get("size_estimate")), not exact),
-        "warnings": report.get("warnings", []),
+        "warnings": warnings,
         "unmet": bool(report.get("unmet")),
         "upscale_needed": bool(report.get("upscale_needed")),
         "blocked": item.get("blocked", ""),
@@ -317,23 +435,31 @@ def _print_plan(rows: list[dict]) -> None:
     """План для человека — в stderr, до вопроса."""
     for row in rows:
         warnings = "; ".join(row["warnings"])
+        encode = row["encode"]
+        if "tiff_compression" in row:
+            encode += f" ({TIFF_COMPRESSION.get(row['tiff_compression'], row['tiff_compression'])})"
+        if "pdf_image" in row:
+            encode += f" ({PDF_IMAGE.get(row['pdf_image'], row['pdf_image'])})"
+        if row["profile"]:
+            encode += f", {row['profile']}"
         line = (
             f"{row['file']} (медиа {row['media_id']}, картина {row['painting_id']}): "
-            f"{row['result']}, {row['encode']}, {row['volume']} → {row['name']}"
+            f"{row['result']}, {encode}, {row['volume']} → {row['name']}"
         )
         err(line + (f" — {warnings}" if warnings else ""))
         if row["blocked"]:
             err(f"  нельзя без решения человека: {row['blocked']}")
 
 
-def _prepare(args, ctx: Context, item: dict, recipe: dict) -> None:
-    """Дополняет item картой файла, отчётом предпросмотра и (при --max-mb) пробой.
+def _prepare(args, ctx: Context, item: dict) -> None:
+    """Дополняет item картой файла, рецептом, отчётом предпросмотра и (при --max-mb) пробой.
 
     Ошибка — исключением; имя файла к этому моменту уже в item, если карточка прочитана.
     """
     media_id = item["media_id"]
     card = ctx.get(f"/api/media/{media_id}")
     item.update(file=card["original_name"], painting_id=card["painting_id"])
+    recipe = item["recipe"] = _recipe(args, card)
     report = ctx.send("POST", f"/api/media/{media_id}/preview", json=recipe)["report"]
     item["report"] = report
     if report.get("upscale_needed") and not args.allow_upscale:
@@ -362,9 +488,9 @@ def _name(template: str, file: str) -> str:
     return template.replace("{name}", Path(file).stem) if template else ""
 
 
-def _apply(args, ctx: Context, item: dict, recipe: dict, folder: Path | None) -> dict:
+def _apply(args, ctx: Context, item: dict, folder: Path | None) -> dict:
     body = {
-        "recipe": recipe,
+        "recipe": item["recipe"],
         "mode": "replace" if args.replace else "new",
         "name": "" if args.replace else _name(args.name, item["file"]),
         "label": args.label or "",
@@ -406,12 +532,12 @@ def _edit(args, ctx: Context) -> int:
         raise UsageError("Для нескольких файлов --name — шаблон с {name}, иначе имена совпадут")
     if args.name and args.replace:
         raise UsageError("--name не сочетается с --replace: заменённый файл сохраняет имя")
-    recipe = _recipe(args)
+    _check_flags(args)
     items, failed = [], []
     for media_id in args.media_ids:
         item = {"media_id": media_id, "file": ""}
         try:
-            _prepare(args, ctx, item, recipe)
+            _prepare(args, ctx, item)
         except ApiError as exc:
             if exc.status in STOP_UPLOADS:
                 raise
@@ -454,7 +580,7 @@ def _edit(args, ctx: Context) -> int:
     done = []
     for index, item in enumerate(items):
         try:
-            done.append(_apply(args, ctx, item, recipe, folder))
+            done.append(_apply(args, ctx, item, folder))
             err(f"{item['file']}: готово")
         except ApiError as exc:
             failed.append(
@@ -532,17 +658,32 @@ def _register_edit(media, parents: list) -> None:
     edit.add_argument("media_ids", type=ids, help="номера медиафайлов через запятую")
     edit.add_argument(
         "--format",
-        choices=("jpeg", "png", "tiff", "webp"),
-        default="jpeg",
-        help="формат результата (по умолчанию jpeg)",
+        choices=tuple(EXTS),
+        help="формат результата (по умолчанию — формат исходного; у RAW, PSD, HEIC и AVIF "
+        "больше 40 Мпикс — jpeg)",
     )
-    volume = edit.add_mutually_exclusive_group()
-    volume.add_argument("--quality", type=int, help="качество JPEG/WebP 1–100 (по умолчанию 90)")
-    volume.add_argument(
+    # --quality и --max-mb вместе отклоняет _check_flags: у группы argparse текст английский.
+    edit.add_argument(
+        "--quality",
+        type=int,
+        help="качество 1–100 у jpeg, webp, avif, heic и pdf с JPEG (по умолчанию — исходного "
+        "того же формата, иначе jpeg/webp/pdf 90, avif 75, heic 80)",
+    )
+    edit.add_argument(
         "--max-mb",
         type=_megabytes,
         help="предел объёма в МБ (1 МБ = 1024×1024 байт, как в браузере); "
-        "сначала проба сжатия с точным объёмом",
+        "сначала проба сжатия с точным объёмом; без флага объём не ограничен",
+    )
+    edit.add_argument(
+        "--tiff-compression",
+        choices=("lzw", "zip", "none"),
+        help="сжатие TIFF без потерь (по умолчанию lzw); none — без сжатия; только у TIFF",
+    )
+    edit.add_argument(
+        "--pdf-image",
+        choices=("jpeg", "lossless"),
+        help="изображение в PDF: jpeg (по умолчанию) или lossless — без потерь; только у PDF",
     )
     size = edit.add_mutually_exclusive_group()
     size.add_argument("--long-side", type=int, metavar="PX", help="длинная сторона в пикселях")
@@ -559,8 +700,9 @@ def _register_edit(media, parents: list) -> None:
     edit.add_argument("--pad-color", help="цвет полей, например '#ffffff'")
     edit.add_argument(
         "--profile",
-        choices=("screen", "print", "keep"),
-        help="цвет: screen — sRGB (по умолчанию), print — для печати, keep — как есть",
+        choices=tuple(PROFILES),
+        help="цвет: screen — sRGB (по умолчанию), print — печать RGB (ClayRGB), "
+        "cmyk — печать CMYK (ISO Coated v2; только jpeg, tiff, pdf), keep — как у исходного",
     )
     edit.add_argument("--rotate", type=int, choices=(90, 180, 270), help="поворот по часовой")
     edit.add_argument(
