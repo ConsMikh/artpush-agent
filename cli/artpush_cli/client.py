@@ -25,7 +25,8 @@ CACHE_PATH = default_cache_path()
 CONTRACT_TTL = 600  # секунд
 TIMEOUT = 60.0
 UPLOAD_TIMEOUT = 600.0
-MAX_RETRIES = 3  # повторов после ответа 429
+MAX_RETRIES = 3  # повторов после ответа 429 или обрыва соединения на чтении
+IDEMPOTENT = {"GET", "HEAD", "OPTIONS"}
 MAX_WAIT = 65  # секунд ожидания по Retry-After
 
 
@@ -129,7 +130,7 @@ class ApiClient:
         headers=None,
         stream: bool = False,
     ) -> httpx.Response:
-        """Запрос к системе; 429 — ждёт и повторяет, не-2xx — ApiError."""
+        """Запрос к системе; 429 и обрыв на чтении — повтор, не-2xx — ApiError."""
         timeout = UPLOAD_TIMEOUT if files else TIMEOUT
         for attempt in range(MAX_RETRIES + 1):
             if files and attempt:
@@ -143,7 +144,14 @@ class ApiClient:
                 headers=headers,
                 timeout=timeout,
             )
-            response = self._http.send(built, stream=stream)
+            try:
+                response = self._http.send(built, stream=stream)
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                # Сервер закрыл простаивающее соединение к нашему запросу (keep-alive
+                # gunicorn — 2 с, как и опрос сеанса): чтение повторяем, запись — нет.
+                if method.upper() in IDEMPOTENT and attempt < MAX_RETRIES:
+                    continue
+                raise
             if response.status_code == 429 and attempt < MAX_RETRIES:
                 wait = _retry_after(response)
                 response.close()
