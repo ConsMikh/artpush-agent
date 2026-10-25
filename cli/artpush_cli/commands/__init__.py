@@ -3,6 +3,7 @@ set_defaults(handler=..., mutates=...[, contract_check=False]); handler(args, ct
 код выхода или None. contract_check=False — команда не сверяет контракт (init, update)."""
 
 import argparse
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -23,6 +24,9 @@ EXIT_FORBIDDEN = 3
 EXIT_RATE = 4
 EXIT_CONTRACT = 5
 
+NOTHING_CHANGED = "Ничего не изменено"
+YES = {"да", "д", "yes", "y"}
+
 # Поля картины со значением из справочника: вид справочника совпадает с именем поля.
 DICT_FIELDS = ("author", "style", "genre", "material", "technique", "status")
 
@@ -39,6 +43,23 @@ class CommandError(Exception):
         self.code = code
         self.exit_code = exit_code
         self.extra = extra
+
+
+def ask(prompt: str) -> bool:
+    """Вопрос человеку в stderr, ответ — строка stdin; пусто или нет stdin — «нет»."""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    try:
+        line = sys.stdin.readline()
+    except (OSError, ValueError, AttributeError):
+        return False
+    return line.strip().casefold() in YES
+
+
+def confirm(prompt: str, yes: bool, **extra) -> None:
+    """Подтверждение человека: --yes или «да» на вопрос; иначе not_confirmed (код 3)."""
+    if not yes and not ask(f"{prompt} (да / нет): "):
+        raise CommandError(NOTHING_CHANGED, "not_confirmed", EXIT_FORBIDDEN, **extra)
 
 
 def preview_required() -> CommandError:

@@ -59,6 +59,7 @@ MISSING_FIELDS = (
     "media",
 )
 WITH_PARTS = ("media", "notes", "history", "placements")
+BADGE_COLUMNS = ("platform", "label", "state", "url", "date", "source")
 DERIVE_GROUPS = (
     "author",
     "style_genre",
@@ -237,8 +238,12 @@ def _thumbs(args, ctx: Context) -> None:
 
 
 def _placements(args, ctx: Context) -> None:
-    items = ctx.get(f"/api/paintings/{args.id}/placements")["items"]
-    emit(items, table=ctx.table, columns=["gallery_title", "url", "section", "published_at"])
+    """Значки размещения по аккаунтам и журнал выгрузок картины (как блок «Площадки»)."""
+    data = ctx.get(f"/api/paintings/{args.id}/placements")
+    if ctx.table:
+        emit(data["badges"], table=True, columns=list(BADGE_COLUMNS))
+        return
+    emit({"badges": data["badges"], "log": data["log"]})
 
 
 def _missing_text(ctx: Context, rows: list[dict], spec: str, enough: int):
@@ -267,7 +272,11 @@ def _get(args, ctx: Context) -> None:
     for part in split(args.with_ or ""):
         if part not in WITH_PARTS:
             raise UsageError(f"--with: одно из {', '.join(WITH_PARTS)}")
-        if part != "media":  # медиа уже в карточке
+        if part == "placements":  # значки уже в карточке; журнал — рядом
+            data = ctx.get(f"/api/paintings/{args.id}/placements")
+            painting["placements"] = data["badges"]
+            painting["placements_log"] = data["log"]
+        elif part != "media":  # медиа уже в карточке
             painting[part] = ctx.get(f"/api/paintings/{args.id}/{part}")["items"]
     emit(painting, table=ctx.table)
 
@@ -391,7 +400,9 @@ def register(subparsers, parents: list) -> None:
     thumbs.set_defaults(handler=_thumbs, mutates=None)
 
     one = group(subparsers, "painting", "Одна картина: карточка и правка")
-    placements = command(one, "placements", "Где картина размещена (площадки)", parents)
+    placements = command(
+        one, "placements", "Где картина размещена: значки по аккаунтам и журнал выгрузок", parents
+    )
     placements.add_argument("id", type=int)
     placements.set_defaults(handler=_placements, mutates=None)
 

@@ -61,7 +61,8 @@ artpush painting price 184 --amount 15000 --currency RUB --purpose Продаж�
 - Ничего не записывай до ответа «да» на показанный план продажи.
 - Дату продажи и сумму спроси у человека, не выдумывай. `--purpose` — назначение цены по имени из
   справочника (основная, Artnow и т. д.): сверь с `artpush dictionaries --table`.
-- Ссылка на Artnow и другие размещения: `artpush painting placements 184`.
+- Где картина размещена (Artnow, Telegram, VK, Instagram) и журнал выгрузок: `artpush painting placements 184`;
+  публикации — в скилле `artpush-publish`.
 
 ## Новая и производная картина
 

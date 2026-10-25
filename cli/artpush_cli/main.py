@@ -26,6 +26,7 @@ from artpush_cli.commands import (
     media,
     notes,
     paintings,
+    publish,
     raw,
     report,
     system,
@@ -50,6 +51,7 @@ COMMAND_MODULES = [
     imports,
     artnow,
     admin,
+    publish,
     report,
 ]
 

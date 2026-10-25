@@ -160,13 +160,14 @@ artpush whoami        # кто я, роль, предел ключа
 | служебные | `init`, `whoami`, `contract`, `update` |
 | поиск и карточка | `paintings search`, `painting get / create / set / text / price / delete / derive` |
 | массовое заполнение | `bulk preview`, `bulk apply`, `bulk undo` |
-| медиа | `media upload / download / list / order / main / transfer` |
+| медиа | `media upload / download / list / order / main / transfer` (`list --label` — только файлы с меткой) |
 | обработка и карточка файла | `media edit` (формат, размер, объём, цвет, выравнивание, тон, поля, подпись, сведения — новые файлы или `--replace`), `media label / note / rename / versions / restore` (окончательного удаления версий нет — только в браузере) |
 | каталоги | `catalogs tree`, `catalog add / members / delete` |
 | заметки и история | `notes list / add`, `history`, `events add` |
 | корзина | `trash list / restore` (очистки нет — только в браузере) |
 | импорт | `import folder / review / regroup / rename / skip / create / sessions / discard` |
 | Artnow | `artnow check / start / resume / wait / stop / works / create` |
+| публикации | `publish accounts / account / profiles / profile / labels apply / readiness / candidates / preview / run / package / mark / placed / log` (выгрузка `publish run` — только после подтверждения человека) |
 | администрирование | `admin dicts / journal / integrity / keys / users` |
 | прочее | `call <METHOD> <путь>` — сырой вызов операции из контракта |
 

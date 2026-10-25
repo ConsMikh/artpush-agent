@@ -2,7 +2,6 @@
 
 import argparse
 import re
-import sys
 import time
 from pathlib import Path
 
@@ -14,10 +13,12 @@ from artpush_cli.commands import (
     EXIT_ERROR,
     EXIT_FORBIDDEN,
     EXIT_RATE,
+    NOTHING_CHANGED,
     POLL_SECONDS,
     CommandError,
     Context,
     UsageError,
+    ask,
     command,
     group,
     ids,
@@ -95,6 +96,8 @@ def _free_name(folder: Path, name: str, media_id: int) -> Path:
 
 
 def _list(args, ctx: Context) -> None:
+    params = {"label": args.label} if args.label else None
+    media = ctx.get(f"/api/paintings/{args.id}/media", params=params)["media"]
     rows = [
         {
             "id": m["id"],
@@ -103,8 +106,9 @@ def _list(args, ctx: Context) -> None:
             "filename": m.get("original_name"),
             "format": m.get("format_label") or m.get("format") or "",
             "status": m.get("processing_status"),
+            "labels": m.get("labels", []),
         }
-        for m in ctx.painting(args.id).get("media", [])
+        for m in media
     ]
     emit(rows, table=ctx.table)
 
@@ -180,8 +184,6 @@ def _transfer(args, ctx: Context, token: str) -> None:
 
 MB = 1024 * 1024  # «МБ» — как в браузере: 1 МБ = 1 048 576 байт
 EDIT_TIMEOUT = 600  # секунд на задание (проба, новый файл, замена)
-NOTHING_CHANGED = "Ничего не изменено"
-YES = {"да", "д", "yes", "y"}
 # Расширение и подпись формата результата — как у сервера и редактора (client/.../editor/recipe.ts).
 EXTS = {
     "jpeg": "jpg",
@@ -244,17 +246,6 @@ COLORS = {"white": "#ffffff", "black": "#000000"}
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 # Поля meta.text рецепта: флаг --meta-<поле>; "" — не записывать, без флага — из карточки.
 META_FIELDS = ("author", "rights", "title", "description", "keywords", "url", "created")
-
-
-def _ask(prompt: str) -> bool:
-    """Вопрос человеку в stderr, ответ — строка stdin; пусто или нет stdin — «нет»."""
-    sys.stderr.write(prompt)
-    sys.stderr.flush()
-    try:
-        line = sys.stdin.readline()
-    except (OSError, ValueError, AttributeError):
-        return False
-    return line.strip().casefold() in YES
 
 
 def _pair(kind):
@@ -870,7 +861,7 @@ def _edit(args, ctx: Context) -> int:
     asks = len(args.media_ids) > 1 or args.replace or human
     if asks and (human or not args.yes):
         what = "Заменить содержимое" if args.replace else "Сохранить новыми файлами"
-        if not _ask(f"{what} ({len(items)} шт.)? (да / нет): "):
+        if not ask(f"{what} ({len(items)} шт.)? (да / нет): "):
             raise CommandError(
                 NOTHING_CHANGED, "not_confirmed", EXIT_FORBIDDEN, plan=plan, failed=failed
             )
@@ -938,7 +929,7 @@ def _restore(args, ctx: Context) -> None:
         f"Вернуть версию {args.version_id} файла {args.media_id}? "
         "Текущее содержимое станет версией. (да / нет): "
     )
-    if not args.yes and not _ask(question):
+    if not args.yes and not ask(question):
         raise CommandError(NOTHING_CHANGED, "not_confirmed", EXIT_FORBIDDEN)
     path = f"/api/media/{args.media_id}/versions/{args.version_id}/restore"
     emit(ctx.send("POST", path), table=ctx.table)
@@ -1214,8 +1205,13 @@ def register(subparsers, parents: list) -> None:
     download.add_argument("--to", required=True, help="папка назначения")
     download.set_defaults(handler=_download, mutates=None)
 
-    listing = command(media, "list", "Медиа картины: номер, вид, главное, файл, состояние", parents)
+    listing = command(
+        media, "list", "Медиа картины: номер, вид, главное, файл, состояние, метки", parents
+    )
     listing.add_argument("id", type=int, help="номер картины")
+    listing.add_argument(
+        "--label", help="только файлы с меткой (без учёта регистра), например telegram"
+    )
     listing.set_defaults(handler=_list, mutates=None)
 
     order = command(media, "order", "Задать порядок медиа", parents)
