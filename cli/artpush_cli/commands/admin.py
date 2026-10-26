@@ -3,10 +3,24 @@
 Нужен ключ с пределом admin у администратора — иначе система ответит 403.
 """
 
-from artpush_cli.commands import CommandError, Context, command, group, two_step
-from artpush_cli.output import emit
+from artpush_cli.commands import (
+    CommandError,
+    Context,
+    command,
+    confirm,
+    group,
+    two_step,
+    wait_for,
+)
+from artpush_cli.output import emit, err
+from artpush_cli.secret_input import masked, read_secret
 
 DICTS = "/api/dictionaries"
+EGRESS = "/api/admin/egress"
+SECRETS_KEY = "/api/admin/secrets/key"
+CHECK_POLL = 2  # секунд между опросами проверки выхода
+CHECK_LIMIT = 60  # секунд: дольше проверка не ждётся
+WORKER_TEXT = "проверка не завершилась — worker недоступен?"
 
 
 def _entries(ctx: Context, kind: str) -> list[dict]:
@@ -108,6 +122,68 @@ def _user_action(action: str):
     return handler
 
 
+def _checked(egress: dict) -> dict:
+    return {state["platform"]: state.get("checked_at") for state in egress.get("states", [])}
+
+
+def _egress(args, ctx: Context) -> None:
+    """Выход к площадкам. Ссылку сервер не отдаёт: только сервер, порт и имя профиля."""
+    if not args.check:
+        emit(ctx.get(EGRESS), table=ctx.table)
+        return
+    before = _checked(ctx.get(EGRESS)) if args.wait else {}
+    ctx.send("POST", f"{EGRESS}/check")
+    if not args.wait:
+        emit({"status": "queued"}, table=ctx.table)
+        return
+
+    def every_platform_rechecked(egress: dict) -> bool:
+        now = _checked(egress)
+        return bool(now) and all(at is not None and at != before.get(p) for p, at in now.items())
+
+    done = wait_for(
+        lambda: ctx.get(EGRESS),
+        every_platform_rechecked,
+        interval=CHECK_POLL,
+        timeout=CHECK_LIMIT,
+        expired=WORKER_TEXT,
+        code="check_timeout",
+    )
+    emit(done, table=ctx.table)
+
+
+def _egress_set_link(args, ctx: Context) -> None:
+    value = read_secret("Ссылка VLESS (ввод скрыт): ", args.from_file)
+    with masked(value):
+        out = ctx.send("PUT", f"{EGRESS}/link", json={"value": value})
+    err("Ссылка записана; показать её нельзя, только сервер, порт и имя профиля")
+    emit(out, table=ctx.table)
+
+
+def _egress_delete_link(args, ctx: Context) -> None:
+    confirm(
+        "Стереть ссылку VLESS? Площадки с маршрутом «через VLESS» перестанут отправляться.",
+        args.yes,
+    )
+    emit(ctx.send("DELETE", f"{EGRESS}/link"), table=ctx.table)
+
+
+def _egress_route(args, ctx: Context) -> None:
+    via = args.way == "vless"
+    where = "через VLESS" if via else "напрямую (адрес сервера виден площадке)"
+    confirm(f"Отправлять в {args.platform} {where}?", args.yes)
+    body = {"via_vless": via}
+    emit(ctx.send("PUT", f"{EGRESS}/routes/{args.platform}", json=body), table=ctx.table)
+
+
+def _secrets(args, ctx: Context) -> None:
+    """Ключ шифрования секретов и их список (только подписи). Значений сервер не отдаёт."""
+    if args.confirm_copy:
+        emit(ctx.send("POST", f"{SECRETS_KEY}/confirm-copy"), table=ctx.table)
+    else:
+        emit(ctx.get(SECRETS_KEY), table=ctx.table)
+
+
 def _actions(parser, name: str):
     """Необязательные действия под командой: без действия — список."""
     return parser.add_subparsers(dest=f"{name}_action", metavar="действие")
@@ -168,6 +244,31 @@ def register(subparsers, parents: list) -> None:
     revoke = command(key_actions, "revoke", "Отозвать ключ", parents)
     revoke.add_argument("id", type=int, help="номер ключа")
     revoke.set_defaults(handler=_revoke, mutates=lambda a: True)
+
+    egress = command(admin, "egress", "Выход к площадкам (VLESS): состояние и проверка", parents)
+    egress.add_argument("--check", action="store_true", help="поставить проверку площадок")
+    egress.add_argument("--wait", action="store_true", help="с --check: дождаться итога (до 60 с)")
+    egress.set_defaults(handler=_egress, mutates=lambda a: a.check)
+    egress_actions = _actions(egress, "egress")
+    link = command(
+        egress_actions, "set-link", "Записать ссылку VLESS: ввод скрыт или файл", parents
+    )
+    link.add_argument("--from-file", help="файл со ссылкой (UTF-8); без него — скрытый ввод")
+    link.set_defaults(handler=_egress_set_link, mutates=lambda a: True)
+    unlink = command(egress_actions, "delete-link", "Стереть ссылку VLESS", parents)
+    unlink.add_argument("--yes", action="store_true", help="подтверждение получено от человека")
+    unlink.set_defaults(handler=_egress_delete_link, mutates=lambda a: True)
+    route = command(egress_actions, "route", "Маршрут площадки: через VLESS или напрямую", parents)
+    route.add_argument("platform", help="площадка: telegram, vk, instagram")
+    route.add_argument("way", choices=("vless", "direct"))
+    route.add_argument("--yes", action="store_true", help="подтверждение получено от человека")
+    route.set_defaults(handler=_egress_route, mutates=lambda a: True)
+
+    secrets = command(admin, "secrets", "Ключ шифрования секретов и список записей", parents)
+    secrets.add_argument(
+        "--confirm-copy", action="store_true", help="отметить, что копия ключа сохранена"
+    )
+    secrets.set_defaults(handler=_secrets, mutates=lambda a: a.confirm_copy)
 
     users = command(admin, "users", "Пользователи", parents)
     users.set_defaults(handler=_users, mutates=None)

@@ -205,6 +205,28 @@ def poll_session(
         ) from None
 
 
+def wait_for(
+    fetch: Callable[[], object],
+    done: Callable[[object], bool],
+    *,
+    interval: float,
+    timeout: float | None,
+    expired: str,
+    code: str = "timeout",
+    **extra,
+):
+    """Опрос fetch() раз в interval секунд, пока done(значение) не вернёт True.
+    timeout — предел в секундах (None — без предела); истёк — CommandError(expired, code)."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        value = fetch()
+        if done(value):
+            return value
+        if deadline is not None and time.monotonic() >= deadline:
+            raise CommandError(expired, code, **extra)
+        time.sleep(interval)
+
+
 def timeout_argument(parser, default: float, what: str) -> None:
     parser.add_argument(
         "--timeout", type=float, default=default, help=f"сколько секунд ждать {what}"

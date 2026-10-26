@@ -1,6 +1,6 @@
 """Публикации: аккаунты площадок, профили назначений, готовность, предпросмотр со снимком,
-запуск только после подтверждения человека, пакет, отметки размещения, журнал, метки по архиву.
-Секреты и боты — в срезе 11."""
+запуск только после подтверждения человека, пакет, отметки размещения, журнал, метки по архиву,
+боты Telegram и их ключи (вводит человек, не модель), проверки, ожидание и разбор выгрузки."""
 
 import contextlib
 import hashlib
@@ -14,6 +14,7 @@ from urllib.parse import unquote
 from artpush_cli import client as client_mod
 from artpush_cli.client import ApiError
 from artpush_cli.commands import (
+    EXIT_ERROR,
     POLL_SECONDS,
     CommandError,
     Context,
@@ -23,8 +24,10 @@ from artpush_cli.commands import (
     group,
     ids,
     timeout_argument,
+    wait_for,
 )
 from artpush_cli.output import emit, err
+from artpush_cli.secret_input import masked, read_secret
 
 BASE = "/api/publishing"
 PLATFORMS = {"telegram": "Telegram", "vk": "VK", "instagram": "Instagram"}
@@ -33,6 +36,10 @@ COUNT = {2: "два", 3: "три", 4: "четыре"}
 SOURCES = ("initial_import", "published", "manual_package", "manual")
 PREVIEW_TIMEOUT = 120
 SNAPSHOT_TTL = 14 * 86400  # секунд: старше — удаляются при записи нового снимка
+METHOD_TEXT = {
+    "api": " — система сама опубликует в канал",
+    "package": " — пакет для ручного размещения",
+}
 STALE_TEXT = "Карточка изменилась — повторите publish preview"
 READ_KEY_HINT = (
     "Ключу только для чтения доступны publish readiness, publish candidates, publish package "
@@ -46,6 +53,12 @@ NOT_PREPARED_HINT = (
 FORCE_HINT = (
     "Повторная выгрузка в тот же аккаунт — та же команда с --force, только после «да» человека"
 )
+CHECK_POLL = 2  # секунд между опросами проверки
+CHECK_LIMIT = 60  # секунд: дольше проверка не ждётся
+RUN_POLL = 3  # секунд между опросами запуска, предела нет
+WORKER_TEXT = "проверка не завершилась — worker недоступен?"
+IN_PROGRESS = ("queued", "running")
+BOT_COLUMNS = ["id", "title", "username", "state", "checked_at", "channels"]
 ACCOUNT_COLUMNS = ["id", "platform", "label", "title", "language", "targets", "is_test"]
 
 
@@ -202,14 +215,20 @@ def _create(args, ctx: Context) -> None:
     emit(ctx.send("POST", f"{BASE}/accounts", json=body), table=ctx.table)
 
 
+def _account_id(ctx: Context, value: str) -> int:
+    """Аккаунт: номер или цель (tg:ru)."""
+    return int(value) if value.isdigit() else _one_target(ctx, value)[0]["id"]
+
+
 def _set(args, ctx: Context) -> None:
+    pk = _account_id(ctx, args.id)
     body: dict = {}
     if args.title is not None:
         body["title"] = args.title
     if args.label is not None:
         body["label"] = args.label
     if args.template_file:
-        templates = dict(_account(ctx, args.id).get("templates") or {})
+        templates = dict(_account(ctx, pk).get("templates") or {})
         for target, path in args.template_file:
             templates[target] = _read_text(path)
         body["templates"] = templates
@@ -219,12 +238,16 @@ def _set(args, ctx: Context) -> None:
         body["pace_daily"] = args.pace_daily
     if args.test is not None:
         body["is_test"] = args.test
+    if args.bot is not None:
+        body["bot"] = _bot_id(ctx, args.bot)
+    elif args.no_bot:
+        body["bot"] = None
     if not body:
         raise UsageError(
             "Нечего менять: --title, --label, --template-file, --pace-minutes, --pace-daily, "
-            "--test или --no-test"
+            "--test, --no-test, --bot или --no-bot"
         )
-    emit(ctx.send("PATCH", f"{BASE}/accounts/{args.id}", json=body), table=ctx.table)
+    emit(ctx.send("PATCH", f"{BASE}/accounts/{pk}", json=body), table=ctx.table)
 
 
 def _archive(action: str):
@@ -507,6 +530,7 @@ def _summary(item: dict, account: dict) -> dict:
         "caption_max": item["texts"]["caption_max"],
         "price": item.get("price", ""),
         "blocking": blocking,
+        "method": item.get("method", ""),
     }
 
 
@@ -550,7 +574,12 @@ def _preview(args, ctx: Context) -> None:
         "title": out["painting"]["title"],
         "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "targets": [
-            {**target, "snapshot": item["snapshot"]}
+            {
+                **target,
+                "snapshot": item["snapshot"],
+                # Способ из предпросмотра: сервер сверяет его при запуске (method_changed).
+                **({"method": item["method"]} if item.get("method") else {}),
+            }
             for target, item in zip(body["targets"], out["items"], strict=True)
         ],
         "summary": summary,
@@ -590,11 +619,12 @@ def _plan_text(cached: dict) -> str:
             f"  → {s['where']} ({s['target']}): файлов {s['files']}, "
             f"подпись {s['caption_len']} из {s.get('caption_max', '?')} знаков"
             + (f", цена {s['price']}" if s.get("price") else "")
+            + METHOD_TEXT.get(s.get("method", ""), "")
         )
     return "\n".join(lines)
 
 
-def _run(args, ctx: Context) -> None:
+def _run(args, ctx: Context) -> int | None:
     cached = _load_snapshot(ctx, args.snapshot)
     err(_plan_text(cached))
     confirm("Выгрузить?", args.yes, snapshot=args.snapshot)
@@ -617,6 +647,8 @@ def _run(args, ctx: Context) -> None:
             "Пакеты готовы: publish package --publication <номер>, после размещения — "
             f"publish placed <номер> --url …; номера: {', '.join(map(str, pubs))}"
         )
+    if args.wait:
+        return _wait_run(args, ctx, out)
     emit(out, table=ctx.table)
 
 
@@ -756,6 +788,214 @@ def _placed(args, ctx: Context) -> None:
     emit(out, table=ctx.table)
 
 
+# --- Боты Telegram, ключи и проверки ---
+
+
+def _bots(ctx: Context) -> list[dict]:
+    return ctx.get(f"{BASE}/bots")["items"]
+
+
+def _bot_id(ctx: Context, value: str) -> int:
+    """Бот: номер или название без учёта регистра."""
+    bots = _bots(ctx)
+    if value.isdigit() and any(b["id"] == int(value) for b in bots):
+        return int(value)
+    wanted = value.strip().casefold()
+    found = [b for b in bots if b["title"].casefold() == wanted]
+    if len(found) == 1:
+        return found[0]["id"]
+    choices = [f"{b['id']} ({b['title']})" for b in bots]
+    if found:
+        raise CommandError(
+            f"Ботов «{value}» несколько — укажите номер", "bot_ambiguous", choices=choices
+        )
+    raise CommandError(f"Бот «{value}» не найден", "bot_not_found", choices=choices)
+
+
+def _bot_row(bot: dict) -> dict:
+    safe = bot.get("safe") or {}
+    return {
+        "id": bot["id"],
+        "title": bot["title"],
+        "username": safe.get("username", ""),
+        "state": bot["state"],
+        "checked_at": bot.get("checked_at"),
+        "channels": ", ".join(c["label"] or c["title"] for c in bot.get("channels", [])),
+    }
+
+
+def _bot_list(args, ctx: Context) -> None:
+    items = _bots(ctx)
+    if ctx.table:
+        emit([_bot_row(b) for b in items], table=True, columns=BOT_COLUMNS)
+    else:
+        emit({"items": items})
+
+
+def _bot_create(args, ctx: Context) -> None:
+    emit(ctx.send("POST", f"{BASE}/bots", json={"title": args.title}), table=ctx.table)
+
+
+def _bot_set(args, ctx: Context) -> None:
+    pk = _bot_id(ctx, args.bot)
+    emit(ctx.send("PATCH", f"{BASE}/bots/{pk}", json={"title": args.title}), table=ctx.table)
+
+
+def _bot_delete(args, ctx: Context) -> None:
+    pk = _bot_id(ctx, args.bot)
+    confirm(f"Удалить бота {pk} вместе с ключом?", args.yes)
+    try:
+        out = ctx.send("DELETE", f"{BASE}/bots/{pk}")
+    except ApiError as exc:
+        if exc.code == "bot_in_use" and isinstance(exc.body, dict):
+            exc.extra["channels"] = exc.body.get("channels", [])
+        raise
+    emit(out, table=ctx.table)
+
+
+def _secret_set(args, ctx: Context) -> None:
+    pk = _bot_id(ctx, args.bot)
+    value = read_secret("Ключ бота от @BotFather (ввод скрыт): ", args.from_file)
+    with masked(value):
+        out = ctx.send("PUT", f"{BASE}/bots/{pk}/secret", json={"value": value})
+    err("Ключ записан и поставлен на проверку; сам ключ показать нельзя")
+    emit(out, table=ctx.table)
+
+
+def _secret_delete(args, ctx: Context) -> None:
+    pk = _bot_id(ctx, args.bot)
+    confirm(f"Стереть ключ бота {pk}? Каналы бота перейдут на пакет.", args.yes)
+    emit(ctx.send("DELETE", f"{BASE}/bots/{pk}/secret"), table=ctx.table)
+
+
+def _bot_check(args, ctx: Context) -> None:
+    pk = _bot_id(ctx, args.bot)
+
+    def current() -> dict:
+        return next(b for b in _bots(ctx) if b["id"] == pk)
+
+    before = current().get("checked_at") if args.wait else None
+    ctx.send("POST", f"{BASE}/bots/{pk}/check")
+    if not args.wait:
+        emit({"status": "queued", "bot": pk}, table=ctx.table)
+        return
+    done = wait_for(
+        current,
+        lambda b: b.get("checked_at") not in (None, before),
+        interval=CHECK_POLL,
+        timeout=CHECK_LIMIT,
+        expired=WORKER_TEXT,
+        code="check_timeout",
+        bot=pk,
+    )
+    emit(done, table=ctx.table)
+
+
+def _account_check(args, ctx: Context) -> None:
+    pk = _account_id(ctx, args.id)
+
+    def current() -> dict:
+        return _account(ctx, pk)
+
+    before = current().get("cred_checked_at") if args.wait else None
+    ctx.send("POST", f"{BASE}/accounts/{pk}/check")
+    if not args.wait:
+        emit({"status": "queued", "account": pk}, table=ctx.table)
+        return
+    done = wait_for(
+        current,
+        lambda a: a.get("cred_checked_at") not in (None, before),
+        interval=CHECK_POLL,
+        timeout=CHECK_LIMIT,
+        expired=WORKER_TEXT,
+        code="check_timeout",
+        account=pk,
+    )
+    emit(done, table=ctx.table)
+
+
+# --- Ход запуска и разбор публикаций ---
+
+
+def _publication_lines(out: dict) -> list[str]:
+    lines = []
+    for pub in out.get("publications", []):
+        head = f"{pub.get('platform', '')} {pub.get('label', '')}".strip()
+        line = f"  № {pub['id']} {head}: {pub['state']}"
+        if pub.get("url"):
+            line += f" {pub['url']}"
+        if pub.get("error"):
+            line += f" — {pub['error']}"
+        lines.append(line)
+    return lines
+
+
+def _wait_run(args, ctx: Context, out: dict) -> int:
+    """Опрос запуска раз в 3 с, пока публикации не выйдут из queued/running. Предела нет;
+    Ctrl-C останавливает ожидание, на сервере отправка идёт дальше."""
+    run_id = out["id"]
+    if not any(p["state"] in IN_PROGRESS for p in out["publications"]):
+        return _report_run(out, ctx)
+    err(f"Запуск {run_id}: жду отправки (Ctrl-C — перестать ждать, отправка продолжится)")
+    try:
+        out = wait_for(
+            lambda: ctx.get(f"{BASE}/runs/{run_id}"),
+            lambda r: not any(p["state"] in IN_PROGRESS for p in r["publications"]),
+            interval=RUN_POLL,
+            timeout=None,
+            expired="",
+        )
+    except KeyboardInterrupt:
+        raise CommandError(
+            f"Прервано: запуск {run_id} продолжает работу на сервере. Состояние: publish log",
+            "interrupted",
+            run=run_id,
+        ) from None
+    return _report_run(out, ctx)
+
+
+def _report_run(out: dict, ctx: Context) -> int:
+    err("\n".join(["Итог запуска:", *_publication_lines(out)]))
+    code = 0
+    for pub in out["publications"]:
+        if pub["state"] == "unconfirmed":
+            err(
+                f"№ {pub['id']}: {pub.get('error') or 'не подтверждено'}. Проверьте канал и "
+                f"выполните: publish resolve {pub['id']} --arrived URL или --retry"
+            )
+            code = EXIT_ERROR
+        elif pub["state"] == "failed":
+            code = EXIT_ERROR
+    emit(out, table=ctx.table)
+    return code
+
+
+def _post_action(action: str):
+    def handler(args, ctx: Context) -> None:
+        emit(ctx.send("POST", f"{BASE}/publications/{args.publication}/{action}"), table=ctx.table)
+
+    return handler
+
+
+def _retry(args, ctx: Context) -> None:
+    confirm(f"Повторить отправку публикации № {args.publication} в её канал?", args.yes)
+    emit(ctx.send("POST", f"{BASE}/publications/{args.publication}/retry"), table=ctx.table)
+
+
+def _resolve(args, ctx: Context) -> None:
+    if args.retry:
+        question = f"Отправить публикацию {args.publication} заново (канал уже проверен)?"
+        body: dict = {"retry": True}
+    else:
+        question = f"Считать публикацию {args.publication} дошедшей: {args.arrived}?"
+        body = {"arrived_url": args.arrived}
+    confirm(question, args.yes)
+    emit(
+        ctx.send("POST", f"{BASE}/publications/{args.publication}/resolve", json=body),
+        table=ctx.table,
+    )
+
+
 # --- Разбор ---
 
 
@@ -819,7 +1059,10 @@ def _register_accounts(pub, parents: list) -> None:
     create.set_defaults(handler=_create, mutates=lambda a: True)
 
     set_ = command(actions, "set", "Изменить аккаунт", parents)
-    set_.add_argument("id", type=int)
+    set_.add_argument("id", help="номер аккаунта или цель (tg:ru)")
+    bot = set_.add_mutually_exclusive_group()
+    bot.add_argument("--bot", help="бот Telegram, которым публиковать в канал: номер или название")
+    bot.add_argument("--no-bot", action="store_true", help="отвязать бота (канал — на пакет)")
     set_.add_argument("--title")
     set_.add_argument("--label", help="метка до 3 знаков")
     set_.add_argument(
@@ -838,6 +1081,11 @@ def _register_accounts(pub, parents: list) -> None:
     test.add_argument("--no-test", dest="test", action="store_const", const=False)
     set_.set_defaults(handler=_set, mutates=lambda a: True, test=None)
 
+    check = command(actions, "check", "Проверить канал: права бота и доступ", parents)
+    check.add_argument("id", help="номер аккаунта или цель (tg:ru)")
+    check.add_argument("--wait", action="store_true", help="дождаться итога (до 60 с)")
+    check.set_defaults(handler=_account_check, mutates=lambda a: True)
+
     for action, what in (("archive", "Убрать в архив"), ("unarchive", "Вернуть из архива")):
         parser = command(actions, action, what, parents)
         parser.add_argument("id", type=int)
@@ -847,6 +1095,45 @@ def _register_accounts(pub, parents: list) -> None:
     delete.add_argument("id", type=int)
     _yes(delete)
     delete.set_defaults(handler=_delete, mutates=lambda a: True)
+
+
+def _register_bots(pub, parents: list) -> None:
+    one = pub.add_parser("bot", help="Боты Telegram и их ключи", description="Боты Telegram")
+    actions = one.add_subparsers(dest="bot_action", metavar="действие")
+
+    command(actions, "list", "Боты со статусом проверки и каналами", parents).set_defaults(
+        handler=_bot_list, mutates=None
+    )
+    create = command(actions, "create", "Завести бота (ключ — отдельно: bot secret set)", parents)
+    create.add_argument("--title", required=True, help="название бота")
+    create.set_defaults(handler=_bot_create, mutates=lambda a: True)
+
+    set_ = command(actions, "set", "Переименовать бота", parents)
+    set_.add_argument("bot", help="номер или название")
+    set_.add_argument("--title", required=True)
+    set_.set_defaults(handler=_bot_set, mutates=lambda a: True)
+
+    delete = command(actions, "delete", "Удалить бота (с подтверждением)", parents)
+    delete.add_argument("bot", help="номер или название")
+    _yes(delete)
+    delete.set_defaults(handler=_bot_delete, mutates=lambda a: True)
+
+    secret = actions.add_parser("secret", help="Ключ бота: вводит человек", description="Ключ бота")
+    secrets = secret.add_subparsers(dest="secret_action", metavar="действие")
+    put = command(secrets, "set", "Записать ключ: скрытый ввод в терминале или файл", parents)
+    put.add_argument("bot", help="номер или название")
+    put.add_argument("--from-file", help="файл с ключом (UTF-8); без него — скрытый ввод")
+    put.set_defaults(handler=_secret_set, mutates=lambda a: True)
+
+    wipe = command(secrets, "delete", "Стереть ключ (каналы бота перейдут на пакет)", parents)
+    wipe.add_argument("bot", help="номер или название")
+    _yes(wipe)
+    wipe.set_defaults(handler=_secret_delete, mutates=lambda a: True)
+
+    check = command(secrets, "check", "Проверить бота и его каналы", parents)
+    check.add_argument("bot", help="номер или название")
+    check.add_argument("--wait", action="store_true", help="дождаться итога (до 60 с)")
+    check.set_defaults(handler=_bot_check, mutates=lambda a: True)
 
 
 def _register_profiles(pub, parents: list) -> None:
@@ -878,6 +1165,7 @@ def _register_profiles(pub, parents: list) -> None:
 
 def register(subparsers, parents: list) -> None:
     pub = group(subparsers, "publish", "Публикации на площадках: подготовка, пакет, журнал")
+    _register_bots(pub, parents)
     _register_accounts(pub, parents)
     _register_profiles(pub, parents)
 
@@ -908,7 +1196,33 @@ def register(subparsers, parents: list) -> None:
         "--force", action="store_true", help="повторно в тот же аккаунт (после «да» человека)"
     )
     _yes(run)
+    run.add_argument(
+        "--wait", action="store_true", help="ждать отправки (опрос раз в 3 с) и показать ссылки"
+    )
     run.set_defaults(handler=_run, mutates=lambda a: True)
+
+    for name, what in (
+        ("cancel", "Снять публикацию из очереди"),
+        ("send-description", "Отправить описание, не ушедшее после альбома"),
+    ):
+        action = command(pub, name, what, parents)
+        action.add_argument("publication", type=int, help="номер публикации")
+        action.set_defaults(handler=_post_action(name), mutates=lambda a: True)
+
+    retry = command(pub, "retry", "Повторить неудавшуюся выгрузку (после «да» человека)", parents)
+    retry.add_argument("publication", type=int, help="номер публикации")
+    _yes(retry)
+    retry.set_defaults(handler=_retry, mutates=lambda a: True)
+
+    resolve = command(
+        pub, "resolve", "Разобрать «не подтверждено»: пост дошёл или повторить", parents
+    )
+    resolve.add_argument("publication", type=int, help="номер публикации")
+    how = resolve.add_mutually_exclusive_group(required=True)
+    how.add_argument("--arrived", metavar="URL", help="пост дошёл: ссылка на него")
+    how.add_argument("--retry", action="store_true", help="пост не дошёл: отправить заново")
+    _yes(resolve)
+    resolve.set_defaults(handler=_resolve, mutates=lambda a: True)
 
     package = command(pub, "package", "Пакет публикации: ZIP с файлами и текстами", parents)
     package.add_argument("painting", type=int, nargs="?", help="номер картины")
