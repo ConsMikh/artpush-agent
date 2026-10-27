@@ -174,10 +174,25 @@ def _account(ctx: Context, pk: int) -> dict:
     return found
 
 
+def _upload_cell(account: dict) -> str:
+    """Столбец «выгрузка» (экран 9): ключом или пакетом с причиной. Только Instagram: у остальных
+    способ зависит от бота или сообщества и виден в предпросмотре."""
+    if account.get("platform") != "instagram":
+        return ""
+    state = account.get("cred_state", "")
+    if state == "ok":
+        return "ключом Instagram"
+    if state == "none":
+        return "пакет (ключ не проверялся)"
+    reason = {"no_key": "нет ключа", "expired": "ключ истёк"}.get(state, f"ключ: {state}")
+    return f"пакет ({reason})"
+
+
 def _list_accounts(args, ctx: Context) -> None:
     items = _accounts(ctx, archived=args.archived)
     if ctx.table:
-        emit(items, table=True, columns=[*ACCOUNT_COLUMNS, "archived_at"])
+        rows = [{**a, "upload": _upload_cell(a)} for a in items]
+        emit(rows, table=True, columns=[*ACCOUNT_COLUMNS, "upload", "archived_at"])
     else:
         emit({"items": items})
 
@@ -356,7 +371,6 @@ def _labels_apply(args, ctx: Context) -> None:
 
 
 INFO_CODES = {"placed_other"}  # справка; остальные неблокирующие причины — предупреждения
-METHOD_CODES = {"package_only"}  # способ выгрузки — строкой «способ: …» под картиной
 PLACEMENT_WORDS = {
     "placed": "размещена",
     "outdated": "размещена, устарела",
@@ -385,8 +399,6 @@ def _readiness_lines(out: dict) -> list[str]:
                     PLACEMENT_WORDS.get(row["placement"]["state"], row["placement"]["state"])
                 )
             for reason in row["reasons"]:
-                if reason["code"] in METHOD_CODES:
-                    continue
                 kind = (
                     "причина"
                     if reason["blocking"]
@@ -917,17 +929,65 @@ def _vk_state_line(account: dict) -> str:
     return f"VK{' ' + name if name else ''}: {text}"
 
 
-def _vk_account_id(ctx: Context, value: str) -> int:
-    """Аккаунт VK для ключа сообщества; у Telegram ключ у бота — отказ до запроса ключа."""
+INSTAGRAM_STATES = {
+    "none": "ключ не проверялся",
+    "ok": "работает",
+    "wrong_account": "ключ выдан другому профилю — создайте ключ для этого профиля",
+    "personal": "профиль личный — нужен «Автор» или «Бизнес»",
+    "expired": "ключ истёк — запишите новый (publish account secret set)",
+    "rejected": "Instagram не принял ключ — запишите новый (publish account secret set)",
+    "not_found": "не указан профиль Instagram — заполните поле «Профиль» аккаунта",
+    "no_rights": "у ключа нет права публиковать в Instagram — создайте ключ с этим правом",
+    "no_egress": "нет выхода к Instagram — настройте его у администратора",
+    "down": "Instagram сейчас не отвечает — повторите проверку позже",
+    "no_key": "ключа нет — человек вводит его: publish account secret set",
+}
+IG_TYPES = {"MEDIA_CREATOR": "Автор", "BUSINESS": "Бизнес", "PERSONAL": "Личный"}
+KEY_PROMPTS = {
+    "vk": "Ключ сообщества VK (ввод скрыт): ",
+    "instagram": "Ключ Instagram (ввод скрыт): ",
+}
+KEY_ERASE = {
+    "vk": "Стереть ключ сообщества VK у аккаунта {pk}? Выгрузка на стену перейдёт на пакет.",
+    "instagram": "Стереть ключ Instagram у аккаунта {pk}? Выгрузка в Instagram перейдёт на пакет.",
+}
+
+
+def _day(value: str) -> str:
+    """Дата из ISO-строки сервера (UTC) в местном времени, ДД.ММ.ГГГГ."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime("%d.%m.%Y")
+
+
+def _instagram_state_lines(account: dict) -> list[str]:
+    """Вид как на экране 9: профиль, состояние и срок ключа. Сам ключ сервер не отдаёт."""
+    state = account.get("cred_state", "")
+    key = INSTAGRAM_STATES.get(state) or account.get("cred_error") or state
+    if state == "ok" and account.get("token_expires_at"):
+        key += f" · действует до {_day(account['token_expires_at'])}"
+        if account.get("token_refreshed_at"):
+            key += f" · продлён {_day(account['token_refreshed_at'])}"
+    name = account.get("ig_username")
+    kind = IG_TYPES.get(account.get("ig_account_type") or "")
+    head = f"Instagram{' @' + name if name else ''}" + (f" · тип «{kind}»" if kind else "")
+    lines = [head, f"  ключ  {key}"]
+    quota = account.get("ig_quota")
+    if quota:
+        lines.append(f"  квота  сегодня {quota['used']} из {quota['total']}")
+    return lines
+
+
+def _key_account(ctx: Context, value: str) -> tuple[int, str]:
+    """Аккаунт с ключом (VK, Instagram) и его площадка; у Telegram ключ у бота — отказ."""
     pk = _account_id(ctx, value)
-    if _account(ctx, pk).get("platform") == "telegram":
+    platform = _account(ctx, pk).get("platform", "")
+    if platform == "telegram":
         raise CommandError(TELEGRAM_KEY_HINT, "secret_on_bot")
-    return pk
+    return pk, platform
 
 
 def _vk_key_set(args, ctx: Context) -> None:
-    pk = _vk_account_id(ctx, args.id)
-    value = read_secret("Ключ сообщества VK (ввод скрыт): ", args.from_file)
+    pk, platform = _key_account(ctx, args.id)
+    value = read_secret(KEY_PROMPTS.get(platform, "Ключ (ввод скрыт): "), args.from_file)
     try:
         with masked(value):
             out = ctx.send("PUT", f"{BASE}/accounts/{pk}/secret", json={"value": value})
@@ -941,11 +1001,8 @@ def _vk_key_set(args, ctx: Context) -> None:
 
 
 def _vk_key_delete(args, ctx: Context) -> None:
-    pk = _vk_account_id(ctx, args.id)
-    confirm(
-        f"Стереть ключ сообщества VK у аккаунта {pk}? Выгрузка на стену перейдёт на пакет.",
-        args.yes,
-    )
+    pk, platform = _key_account(ctx, args.id)
+    confirm(KEY_ERASE.get(platform, "Стереть ключ у аккаунта {pk}?").format(pk=pk), args.yes)
     emit(ctx.send("DELETE", f"{BASE}/accounts/{pk}/secret"), table=ctx.table)
 
 
@@ -971,10 +1028,31 @@ def _account_check(args, ctx: Context) -> None:
     )
     if done.get("platform") == "vk":
         err(_vk_state_line(done))
+    elif done.get("platform") == "instagram":
+        err("\n".join(_instagram_state_lines(done)))
     emit(done, table=ctx.table)
 
 
 # --- Ход запуска и разбор публикаций ---
+
+
+STEP_WORDS = {
+    "quota": "ждём: дневной предел Instagram исчерпан",
+    "fetch": "Instagram забирает фото",
+    "processing": "Instagram обрабатывает публикацию",
+    "publishing": "публикуем",
+}
+
+
+def _step_text(pub: dict) -> str:
+    """Шаг отправки Instagram (`progress` публикации); пусто, если шага нет или отправка кончена."""
+    progress = pub.get("progress")
+    if not progress or pub.get("state") not in IN_PROGRESS:
+        return ""
+    text = STEP_WORDS.get(progress["step"], progress["step"])
+    if progress["step"] == "fetch" and progress["total"]:
+        text += f" {progress['done']} из {progress['total']}"
+    return f"№ {pub['id']}: {text}"
 
 
 def _publication_lines(out: dict) -> list[str]:
@@ -998,8 +1076,19 @@ def _wait_run(args, ctx: Context, out: dict) -> int:
         return _report_run(out, ctx)
     err(f"Запуск {run_id}: жду отправки (Ctrl-C — перестать ждать, отправка продолжится)")
     try:
+        shown: dict[int, str] = {}
+
+        def poll() -> dict:
+            run = ctx.get(f"{BASE}/runs/{run_id}")
+            for pub in run["publications"]:
+                text = _step_text(pub)
+                if text and shown.get(pub["id"]) != text:  # печатаем только смену шага
+                    shown[pub["id"]] = text
+                    err(f"  {datetime.now().strftime('%H:%M:%S')}  {text}")
+            return run
+
         out = wait_for(
-            lambda: ctx.get(f"{BASE}/runs/{run_id}"),
+            poll,
             lambda r: not any(p["state"] in IN_PROGRESS for p in r["publications"]),
             interval=RUN_POLL,
             timeout=None,
@@ -1147,15 +1236,17 @@ def _register_accounts(pub, parents: list) -> None:
     check.set_defaults(handler=_account_check, mutates=lambda a: True)
 
     secret = actions.add_parser(
-        "secret", help="Ключ сообщества VK: вводит человек", description="Ключ сообщества VK"
+        "secret",
+        help="Ключ сообщества VK или Instagram: вводит человек",
+        description="Ключ сообщества VK или ключ Instagram",
     )
     secrets = secret.add_subparsers(dest="secret_action", metavar="действие")
     put = command(secrets, "set", "Записать ключ: скрытый ввод в терминале или файл", parents)
-    put.add_argument("id", help="номер аккаунта или цель (vk:vk)")
+    put.add_argument("id", help="номер аккаунта или цель (vk:vk, instagram:ru)")
     put.add_argument("--from-file", help="файл с ключом (UTF-8); без него — скрытый ввод")
     put.set_defaults(handler=_vk_key_set, mutates=lambda a: True)
     wipe = command(secrets, "delete", "Стереть ключ (выгрузка перейдёт на пакет)", parents)
-    wipe.add_argument("id", help="номер аккаунта или цель (vk:vk)")
+    wipe.add_argument("id", help="номер аккаунта или цель (vk:vk, instagram:ru)")
     _yes(wipe)
     wipe.set_defaults(handler=_vk_key_delete, mutates=lambda a: True)
 
