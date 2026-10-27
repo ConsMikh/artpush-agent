@@ -891,6 +891,64 @@ def _bot_check(args, ctx: Context) -> None:
     emit(done, table=ctx.table)
 
 
+TELEGRAM_KEY_HINT = "У Telegram ключ у бота: publish bot secret set <бот>"
+VK_STATES = {
+    "none": "ключ не проверялся",
+    "ok": "ключ принят, сообщество доступно",
+    "rejected": "VK не принял ключ — запишите новый (publish account secret set)",
+    "no_rights": "у ключа нет нужных прав сообщества",
+    "not_found": "сообщество не найдено — проверьте поле «Сообщество»",
+    "no_messages": (
+        "в сообществе выключены сообщения или у ключа нет права «Сообщения сообщества»"
+        " — VK не даёт загрузить фото"
+    ),
+    "wrong_group": "ключ выдан другому сообществу — создайте ключ в настройках этого сообщества",
+    "closed": "VK закрыл этот путь — публикуйте пакетом",
+    "down": "VK сейчас не отвечает — повторите проверку позже",
+    "no_egress": "нет выхода к VK — настройте его у администратора",
+    "no_key": "ключа нет — человек вводит его: publish account secret set",
+}
+
+
+def _vk_state_line(account: dict) -> str:
+    state = account.get("cred_state", "")
+    text = VK_STATES.get(state) or account.get("cred_error") or state
+    name = account.get("vk_screen_name")
+    return f"VK{' ' + name if name else ''}: {text}"
+
+
+def _vk_account_id(ctx: Context, value: str) -> int:
+    """Аккаунт VK для ключа сообщества; у Telegram ключ у бота — отказ до запроса ключа."""
+    pk = _account_id(ctx, value)
+    if _account(ctx, pk).get("platform") == "telegram":
+        raise CommandError(TELEGRAM_KEY_HINT, "secret_on_bot")
+    return pk
+
+
+def _vk_key_set(args, ctx: Context) -> None:
+    pk = _vk_account_id(ctx, args.id)
+    value = read_secret("Ключ сообщества VK (ввод скрыт): ", args.from_file)
+    try:
+        with masked(value):
+            out = ctx.send("PUT", f"{BASE}/accounts/{pk}/secret", json={"value": value})
+    except ApiError as exc:
+        if exc.code == "secret_on_bot":
+            raise CommandError(TELEGRAM_KEY_HINT, "secret_on_bot") from None
+        raise
+    err("Ключ записан и поставлен на проверку; сам ключ показать нельзя")
+    err(f"Проверить: publish account check {args.id} --wait")
+    emit(out, table=ctx.table)
+
+
+def _vk_key_delete(args, ctx: Context) -> None:
+    pk = _vk_account_id(ctx, args.id)
+    confirm(
+        f"Стереть ключ сообщества VK у аккаунта {pk}? Выгрузка на стену перейдёт на пакет.",
+        args.yes,
+    )
+    emit(ctx.send("DELETE", f"{BASE}/accounts/{pk}/secret"), table=ctx.table)
+
+
 def _account_check(args, ctx: Context) -> None:
     pk = _account_id(ctx, args.id)
 
@@ -911,6 +969,8 @@ def _account_check(args, ctx: Context) -> None:
         code="check_timeout",
         account=pk,
     )
+    if done.get("platform") == "vk":
+        err(_vk_state_line(done))
     emit(done, table=ctx.table)
 
 
@@ -1085,6 +1145,19 @@ def _register_accounts(pub, parents: list) -> None:
     check.add_argument("id", help="номер аккаунта или цель (tg:ru)")
     check.add_argument("--wait", action="store_true", help="дождаться итога (до 60 с)")
     check.set_defaults(handler=_account_check, mutates=lambda a: True)
+
+    secret = actions.add_parser(
+        "secret", help="Ключ сообщества VK: вводит человек", description="Ключ сообщества VK"
+    )
+    secrets = secret.add_subparsers(dest="secret_action", metavar="действие")
+    put = command(secrets, "set", "Записать ключ: скрытый ввод в терминале или файл", parents)
+    put.add_argument("id", help="номер аккаунта или цель (vk:vk)")
+    put.add_argument("--from-file", help="файл с ключом (UTF-8); без него — скрытый ввод")
+    put.set_defaults(handler=_vk_key_set, mutates=lambda a: True)
+    wipe = command(secrets, "delete", "Стереть ключ (выгрузка перейдёт на пакет)", parents)
+    wipe.add_argument("id", help="номер аккаунта или цель (vk:vk)")
+    _yes(wipe)
+    wipe.set_defaults(handler=_vk_key_delete, mutates=lambda a: True)
 
     for action, what in (("archive", "Убрать в архив"), ("unarchive", "Вернуть из архива")):
         parser = command(actions, action, what, parents)
