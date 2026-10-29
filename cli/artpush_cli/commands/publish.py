@@ -1204,7 +1204,7 @@ def _register_accounts(pub, parents: list) -> None:
         "--target", action="append", default=[], help="назначение, например telegram.post"
     )
     create.add_argument("--address", help="адрес канала или страницы")
-    create.add_argument("--test", action="store_true", help="тестовый (только администратор)")
+    create.add_argument("--test", action="store_true", help="тестовый (ставит владелица)")
     create.set_defaults(handler=_create, mutates=lambda a: True)
 
     set_ = command(actions, "set", "Изменить аккаунт", parents)
@@ -1225,7 +1225,7 @@ def _register_accounts(pub, parents: list) -> None:
     set_.add_argument("--pace-daily", type=int, help="публикаций в сутки")
     test = set_.add_mutually_exclusive_group()
     test.add_argument(
-        "--test", dest="test", action="store_const", const=True, help="пометить тестовым (админ)"
+        "--test", dest="test", action="store_const", const=True, help="пометить тестовым"
     )
     test.add_argument("--no-test", dest="test", action="store_const", const=False)
     set_.set_defaults(handler=_set, mutates=lambda a: True, test=None)

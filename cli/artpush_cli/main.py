@@ -18,6 +18,7 @@ from artpush_cli.commands import (
     Context,
     UsageError,
     admin,
+    archive,
     artnow,
     bulk,
     catalogs,
@@ -50,10 +51,16 @@ COMMAND_MODULES = [
     bulk,
     imports,
     artnow,
+    archive,
     admin,
     publish,
     report,
 ]
+
+ADMIN_NO_ARCHIVE_HINT = (
+    "Это ключ администратора: у администратора нет архива. Для картин, корзины, публикаций"
+    " и выгрузки нужен ключ художницы — artpush whoami покажет, чей ключ сейчас"
+)
 
 # Поля ответа 409 о конфликте версий, которые попадают в JSON ошибки.
 CONFLICT_FIELDS = ("field", "by", "at", "their_label", "mine_label")
@@ -161,6 +168,8 @@ def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None
         if exc.code == "conflict" and isinstance(exc.body, dict):
             extra = {name: exc.body[name] for name in CONFLICT_FIELDS if name in exc.body}
         extra.update(exc.extra)
+        if exc.code == "admin_no_archive":
+            extra["hint"] = ADMIN_NO_ARCHIVE_HINT
         return _fail(_exit_for(exc.status), exc.detail, exc.code, exc.status, **extra)
     except CommandError as exc:
         return _fail(exc.exit_code, str(exc), exc.code, None, **exc.extra)

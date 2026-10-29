@@ -24,6 +24,9 @@ packages = ["artpush_cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Сборка зеркала гоняет настоящие git и curl (36 из 43 с набора): отдельное задание CI test:mirror, локально — -m mirror
+addopts = "-m 'not mirror'"
+markers = ["mirror: сборка и выпуск публичного зеркала (scripts/*agent_mirror*)"]
 
 [tool.ruff]
 line-length = 100

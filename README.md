@@ -149,6 +149,8 @@ artpush whoami        # кто я, роль, предел ключа
 
 Ключ имеет предел: `read` (только чтение), `write` (чтение и правка), `admin` (плюс администрирование, только
 у администратора) — и срок 7, 30 или 90 дней. Отозвать ключ можно там же, где его выпустили.
+Ключ работает с архивом своего владельца. У администратора архива нет: с его ключом работают только команды
+`admin`, остальные отвечают кодом 3 `admin_no_archive` — нужен ключ художницы.
 
 ## Команды
 
@@ -165,10 +167,12 @@ artpush whoami        # кто я, роль, предел ключа
 | каталоги | `catalogs tree`, `catalog add / members / delete` |
 | заметки и история | `notes list / add`, `history`, `events add` |
 | корзина | `trash list / restore` (очистки нет — только в браузере) |
+| справочники | `dictionaries` (значения и номера), `dicts <вид> list / add / rename / replace / delete` (свои) |
+| выгрузка архива | `archive export` (`--status`, `--download ПАПКА`) — весь архив одним ZIP |
 | импорт | `import folder / review / regroup / rename / skip / create / sessions / discard` |
 | Artnow | `artnow check / start / resume / wait / stop / works / create` |
 | публикации | `publish accounts / account / profiles / profile / labels apply / readiness / candidates / preview / run / package / mark / placed / log` (выгрузка `publish run` — только после подтверждения человека) |
-| администрирование | `admin dicts / journal / integrity / keys / users` |
+| администрирование | `admin dicts` (эталон, языки, валюты) `/ stats / export / delete-archive / journal / integrity / keys / users`; `delete-archive` — только человек в терминале, вводом логина |
 | прочее | `call <METHOD> <путь>` — сырой вызов операции из контракта |
 
 ### Обработка: `media edit`

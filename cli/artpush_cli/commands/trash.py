@@ -1,9 +1,11 @@
 """Корзина: список и восстановление. Очистки нет — она только в браузере."""
 
-from artpush_cli.commands import Context, command, group
-from artpush_cli.output import emit
+from artpush_cli.client import ApiError
+from artpush_cli.commands import CommandError, Context, command, group
+from artpush_cli.output import emit, err
 
 KINDS = ("painting", "media", "catalog")
+LABELS = {"painting": "Картины", "media": "Медиафайла", "catalog": "Каталога"}
 
 
 def _list(args, ctx: Context) -> None:
@@ -13,8 +15,21 @@ def _list(args, ctx: Context) -> None:
 
 def _restore(args, ctx: Context) -> None:
     kind = next(k for k in KINDS if getattr(args, k) is not None)
-    body = {"items": [{"kind": kind, "id": getattr(args, kind)}]}
-    emit(ctx.send("POST", "/api/trash/restore", json=body), table=ctx.table)
+    pk = getattr(args, kind)
+    body = {"items": [{"kind": kind, "id": pk}]}
+    try:
+        out = ctx.send("POST", "/api/trash/restore", json=body)
+    except ApiError as exc:
+        if exc.status != 404:
+            raise
+        label = LABELS[kind]
+        raise CommandError(
+            f"{label} № {pk} нет в корзине вашего архива — проверьте номер: artpush trash list",
+            "not_found",
+        ) from None
+    if not out.get("restored"):
+        err(f"{LABELS[kind]} № {pk} уже не в корзине — восстанавливать нечего")
+    emit(out, table=ctx.table)
 
 
 def register(subparsers, parents: list) -> None:

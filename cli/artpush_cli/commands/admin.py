@@ -1,85 +1,33 @@
-"""Администрирование: справочники, журнал, целостность, ключи, пользователи.
+"""Администрирование: эталон справочников, журнал, целостность, ключи, пользователи,
+статистика, выгрузка и удаление архивов художниц.
 
-Нужен ключ с пределом admin у администратора — иначе система ответит 403.
+Нужен ключ с пределом admin у администратора — иначе система ответит 403. Своего архива у
+администратора нет: картины, корзина, публикации — только с ключом художницы.
 """
 
+import sys
+
+from artpush_cli import config
 from artpush_cli.commands import (
+    EXIT_FORBIDDEN,
     CommandError,
     Context,
+    archive,
     command,
     confirm,
+    dictionaries,
     group,
-    two_step,
     wait_for,
 )
 from artpush_cli.output import emit, err
 from artpush_cli.secret_input import masked, read_secret
 
-DICTS = "/api/dictionaries"
+REFERENCE = "/api/admin/reference"
 EGRESS = "/api/admin/egress"
 SECRETS_KEY = "/api/admin/secrets/key"
 CHECK_POLL = 2  # секунд между опросами проверки выхода
 CHECK_LIMIT = 60  # секунд: дольше проверка не ждётся
 WORKER_TEXT = "проверка не завершилась — worker недоступен?"
-
-
-def _entries(ctx: Context, kind: str) -> list[dict]:
-    return ctx.get(f"{DICTS}/{kind}")
-
-
-def _entry_id(ctx: Context, kind: str, value: str) -> int:
-    """Запись справочника (в т.ч. скрытая) по имени или коду без учёта регистра, либо по номеру."""
-    entries = _entries(ctx, kind)
-    wanted = value.strip().casefold()
-    for entry in entries:
-        if wanted in (entry["name"].casefold(), (entry.get("code") or "").casefold()):
-            return entry["id"]
-    if wanted.isdigit() and any(entry["id"] == int(wanted) for entry in entries):
-        return int(wanted)
-    raise CommandError(
-        f"Значение «{value}» не найдено в справочнике {kind}",
-        "dictionary_value",
-        choices=[entry["name"] for entry in entries],
-    )
-
-
-def _dict_list(args, ctx: Context) -> None:
-    emit(_entries(ctx, args.kind), table=ctx.table)
-
-
-def _dict_add(args, ctx: Context) -> None:
-    body = {"name": args.name, "code": args.code}
-    emit(ctx.send("POST", f"{DICTS}/{args.kind}", json=body), table=ctx.table)
-
-
-def _dict_rename(args, ctx: Context) -> None:
-    pk = _entry_id(ctx, args.kind, args.entry)
-    body = {"name": args.name}
-    emit(ctx.send("PATCH", f"{DICTS}/{args.kind}/{pk}", json=body), table=ctx.table)
-
-
-def _replace_preview(args, ctx: Context) -> None:
-    pk = _entry_id(ctx, args.kind, args.entry)
-    target = _entry_id(ctx, args.kind, args.to)
-    params = {"target_id": target}
-    emit(ctx.get(f"{DICTS}/{args.kind}/{pk}/preview", params=params), table=ctx.table)
-
-
-def _replace(args, ctx: Context, token: str) -> None:
-    pk = _entry_id(ctx, args.kind, args.entry)
-    body = {"target_id": _entry_id(ctx, args.kind, args.to), "preview_token": token}
-    emit(ctx.send("POST", f"{DICTS}/{args.kind}/{pk}/replace", json=body), table=ctx.table)
-
-
-def _delete_preview(args, ctx: Context) -> None:
-    pk = _entry_id(ctx, args.kind, args.entry)
-    emit(ctx.get(f"{DICTS}/{args.kind}/{pk}/preview"), table=ctx.table)
-
-
-def _delete(args, ctx: Context, token: str) -> None:
-    pk = _entry_id(ctx, args.kind, args.entry)
-    params = {"preview_token": token}
-    emit(ctx.send("DELETE", f"{DICTS}/{args.kind}/{pk}", params=params), table=ctx.table)
 
 
 def _journal(args, ctx: Context) -> None:
@@ -110,8 +58,177 @@ def _revoke(args, ctx: Context) -> None:
     emit(ctx.send("POST", f"/api/admin/keys/{args.id}/revoke"), table=ctx.table)
 
 
+USERS = "/api/admin/users"
+USER_COLUMNS = ["username", "name", "deactivated", "deleting", "active_keys", "last_seen_at"]
+STATS_COLUMNS = [
+    "username",
+    "name",
+    "state",
+    "last_seen",
+    "paintings",
+    "media",
+    "disk",
+    "accounts",
+    "published",
+    "errors_30d",
+    "export",
+]
+UNITS = ("Б", "КБ", "МБ", "ГБ", "ТБ")
+
+
 def _users(args, ctx: Context) -> None:
-    emit(ctx.get("/api/admin/users"), table=ctx.table)
+    out = ctx.get(USERS)
+    if ctx.table:
+        emit(out["items"], table=True, columns=USER_COLUMNS)
+    else:
+        emit(out)
+
+
+def size(value: int | None) -> str:
+    """Байты по-человечески: «0 Б», «512 Б», «3.0 ГБ» (основание 1024)."""
+    amount, unit = float(value or 0), 0
+    while amount >= 1024 and unit < len(UNITS) - 1:
+        amount, unit = amount / 1024, unit + 1
+    return f"{int(amount)} Б" if unit == 0 else f"{amount:.1f} {UNITS[unit]}"
+
+
+def _accounts(accounts: dict) -> str:
+    parts = []
+    for platform, count in (accounts or {}).items():
+        test = f" (тест {count['test']})" if count.get("test") else ""
+        parts.append(f"{platform} {count['total']}{test}")
+    return ", ".join(parts)
+
+
+def _published(published: dict) -> str:
+    """«площадка картин/файлов» через запятую."""
+    items = (published or {}).items()
+    return ", ".join(f"{where} {n['paintings']}/{n['files']}" for where, n in items)
+
+
+def _export(export: dict | None) -> str:
+    if not export:
+        return ""
+    state = export["state"]
+    if state in ("queued", "running"):
+        return f"{state} {export.get('progress', 0)}%"
+    if state == "ready" and export.get("expires_at"):
+        return f"ready до {export['expires_at'][:10]}"
+    return state
+
+
+def _state(row: dict) -> str:
+    if row.get("deleting"):
+        return "удаляется"
+    return "отключена" if row.get("deactivated") else "активна"
+
+
+def _row(row: dict) -> dict:
+    return {
+        "username": row["username"],
+        "name": row.get("name") or row["username"],
+        "state": _state(row),
+        "last_seen": (row.get("last_seen_at") or "")[:10],
+        "paintings": row["paintings"],
+        "media": row["media"],
+        "disk": size(row["disk_bytes"]),
+        "accounts": _accounts(row.get("accounts")),
+        "published": _published(row.get("published")),
+        "errors_30d": row["errors_30d"],
+        "export": _export(row.get("export")),
+    }
+
+
+def _vless(state: dict | None) -> str:
+    state = state or {}
+    if not state.get("link"):
+        return "ссылки нет"
+    if not state.get("running"):
+        text = "ссылка есть, не запущен"
+    elif state.get("ok") is None:
+        text = "не проверялся"
+    else:
+        text = "работает" if state["ok"] else "сбой проверки"
+    checked = (state.get("checked_at") or "").replace("T", " ")[:16]
+    return f"{text}, проверено {checked}" if checked else text
+
+
+def _totals(totals: dict) -> dict:
+    return {
+        "users": totals["users"],
+        "deactivated": totals["deactivated"],
+        "paintings": totals["paintings"],
+        "media": totals["media"],
+        "disk": size(totals["disk_bytes"]),
+        "accounts": _accounts(totals.get("accounts")),
+        "published": _published(totals.get("published")),
+        "errors_30d": totals["errors_30d"],
+        "free_disk": f"{size(totals['free_bytes'])} из {size(totals['total_bytes'])}",
+        "vless": _vless(totals.get("egress_state")),
+    }
+
+
+def _stats(args, ctx: Context) -> None:
+    """Сводка по художницам и системе: строка на художницу и итоги одной таблицей поле—значение."""
+    out = ctx.get(USERS)
+    rows, totals = [_row(row) for row in out["items"]], _totals(out["totals"])
+    if not ctx.table:
+        emit({"items": rows, "totals": totals})
+        return
+    if rows:
+        emit(rows, table=True, columns=STATS_COLUMNS)
+        print()
+    emit(totals, table=True)
+
+
+def _admin_export(args, ctx: Context) -> None:
+    archive.run_export(args, ctx, archive.admin_export_path(args.username))
+
+
+def open_tty():
+    """Терминал человека напрямую, мимо stdin: ответ в конвейер или из файла не подставить.
+    Нет терминала (агент, cron) — OSError."""
+    return open("CONIN$" if config.is_windows() else "/dev/tty", encoding="utf-8")  # noqa: SIM115
+
+
+def _delete_archive(args, ctx: Context) -> None:
+    """Удаление архива необратимо: подтверждает человек вводом логина в своём терминале."""
+    row = next((r for r in ctx.get(USERS)["items"] if r["username"] == args.username), None)
+    if row is None:
+        raise CommandError(f"Пользователь «{args.username}» не найден", "user_not_found")
+    try:
+        tty = open_tty()
+    except OSError:
+        raise CommandError(
+            "Удалить архив может только человек в своём терминале: пусть выполнит"
+            f" artpush admin delete-archive {args.username} и введёт логин",
+            "terminal_required",
+            EXIT_FORBIDDEN,
+        ) from None
+    with tty:
+        typed = _confirm_login(args, row, tty)
+    body = {"confirm": typed}
+    emit(ctx.send("POST", f"{USERS}/{args.username}/delete", json=body), table=ctx.table)
+
+
+def _confirm_login(args, row: dict, tty) -> str:
+    """Показать, что удаляется, и прочитать логин из терминала; не совпал — not_confirmed."""
+    err(
+        f"Удаляется архив «{args.username}» целиком и навсегда: картин {row['paintings']},"
+        f" файлов {row['media']}, {size(row['disk_bytes'])}. Вход и ключи художницы перестанут"
+        " работать."
+    )
+    export = row.get("export") or {}
+    if export.get("state") == "ready":
+        err(f"Свежая выгрузка есть: {_export(export)}")
+    else:
+        err("Свежей выгрузки нет — после удаления данные не вернуть (admin export)")
+    sys.stderr.write("Для подтверждения введите логин: ")
+    sys.stderr.flush()
+    typed = tty.readline().strip()
+    if typed != args.username:
+        raise CommandError("Логин не совпал — ничего не удалено", "not_confirmed", EXIT_FORBIDDEN)
+    return typed
 
 
 def _user_action(action: str):
@@ -189,38 +306,17 @@ def _actions(parser, name: str):
     return parser.add_subparsers(dest=f"{name}_action", metavar="действие")
 
 
-def _dicts(admin, parents: list) -> None:
-    dicts = command(admin, "dicts", "Справочник: список, пополнение, замена, удаление", parents)
-    dicts.add_argument("kind", help="вид справочника, например technique")
-    dicts.set_defaults(handler=_dict_list, mutates=None)
-    actions = _actions(dicts, "dicts")
-
-    list_ = command(actions, "list", "Записи справочника с числом использований", parents)
-    list_.set_defaults(handler=_dict_list, mutates=None)
-
-    add = command(actions, "add", "Добавить запись", parents)
-    add.add_argument("name")
-    add.add_argument("--code", help="код (для языков и валют)")
-    add.set_defaults(handler=_dict_add, mutates=lambda a: True)
-
-    rename = command(actions, "rename", "Переименовать запись", parents)
-    rename.add_argument("entry", help="имя или номер")
-    rename.add_argument("name", help="новое имя")
-    rename.set_defaults(handler=_dict_rename, mutates=lambda a: True)
-
-    replace = command(actions, "replace", "Заменить запись другой во всех картинах", parents)
-    replace.add_argument("entry", help="что заменить: имя или номер")
-    replace.add_argument("--to", required=True, help="на что: имя или номер")
-    two_step(replace, preview=_replace_preview, apply=_replace)
-
-    delete = command(actions, "delete", "Удалить неиспользуемую запись", parents)
-    delete.add_argument("entry", help="имя или номер")
-    two_step(delete, preview=_delete_preview, apply=_delete)
-
-
 def register(subparsers, parents: list) -> None:
     admin = group(subparsers, "admin", "Администрирование (ключ admin)")
-    _dicts(admin, parents)
+    dictionaries.editing(
+        admin,
+        "dicts",
+        "Эталон справочников для новых архивов, языки и валюты",
+        "Свои справочники художницы правит она сама: artpush dicts; значения и номера — artpush"
+        " dictionaries.",
+        REFERENCE,
+        parents,
+    )
 
     journal = command(admin, "journal", "Журнал событий системы", parents)
     journal.add_argument("--since", choices=("day", "week", "all"), default="all")
@@ -269,6 +365,25 @@ def register(subparsers, parents: list) -> None:
         "--confirm-copy", action="store_true", help="отметить, что копия ключа сохранена"
     )
     secrets.set_defaults(handler=_secrets, mutates=lambda a: a.confirm_copy)
+
+    stats = command(admin, "stats", "Статистика: художницы, диск, выгрузки, VLESS", parents)
+    stats.set_defaults(handler=_stats, mutates=None)
+
+    export = command(
+        admin, "export", "Выгрузка архива художницы: запустить, состояние, скачать", parents
+    )
+    export.add_argument("username", help="логин художницы")
+    archive.export_arguments(export)
+    export.set_defaults(handler=_admin_export, mutates=lambda a: not (a.status or a.download))
+
+    delete = command(
+        admin,
+        "delete-archive",
+        "Удалить архив художницы навсегда (ввод логина в терминале)",
+        parents,
+    )
+    delete.add_argument("username", help="логин художницы")
+    delete.set_defaults(handler=_delete_archive, mutates=lambda a: True)
 
     users = command(admin, "users", "Пользователи", parents)
     users.set_defaults(handler=_users, mutates=None)
