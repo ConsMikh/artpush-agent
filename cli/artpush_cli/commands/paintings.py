@@ -6,7 +6,7 @@ import re
 import zipfile
 from pathlib import Path
 
-from artpush_cli import versions
+from artpush_cli import versions, where
 from artpush_cli.client import ApiError
 from artpush_cli.commands import (
     DICT_FIELDS,
@@ -145,7 +145,13 @@ def versioned(
 
 
 def _search(args, ctx: Context) -> None:
-    params: list[tuple[str, str]] = []
+    if any(text.strip().casefold() == "help" for text in args.where):
+        emit(where.help_data()["fields"] if ctx.table else where.help_data(), table=ctx.table)
+        return
+    params: list[tuple[str, str]] = [
+        ("where", json.dumps(where.parse_where(text, ctx), ensure_ascii=False))
+        for text in args.where
+    ]
     if args.q:
         params.append(("q", args.q))
     for kind in FILTER_DICTS:
@@ -375,7 +381,9 @@ def register(subparsers, parents: list) -> None:
     search.add_argument(
         "--origin", action="append", default=[], choices=CHOICE_FIELDS["origin_category"]
     )
-    search.add_argument("--year", type=int, help="год (точно)")
+    search.add_argument(
+        "--year", type=int, help="год: период картины пересекает этот год (2018–2020 — и 2019)"
+    )
     search.add_argument("--year-min", type=int)
     search.add_argument("--year-max", type=int)
     search.add_argument("--catalog", help="каталог: имя, путь «А / Б» или номер")
@@ -388,6 +396,14 @@ def register(subparsers, parents: list) -> None:
         help=f"не заполнено: {', '.join(MISSING_FIELDS)} или text:<язык> (нет названия) "
         "или text:<язык>:description (нет описания) "
         "(text: читает карточки по одной; total = null, если просмотрены не все)",
+    )
+    search.add_argument(
+        "--where",
+        action="append",
+        default=[],
+        metavar="УСЛОВИЕ",
+        help="условие словами, например «ширина 40..», «описание:en не заполнено»; "
+        "повторяется, условия — через «и»; список полей и способов: --where help",
     )
     search.add_argument("--sort", help="порядок, например -id")
     search.add_argument("--limit", type=int, default=50)
