@@ -21,6 +21,8 @@ KINDS = {
     "language": "язык",
     "currency": "валюта",
     "price_purpose": "назначение цены",
+    "artist_note_kind": "вид заметки",
+    "artist_doc_kind": "вид документа",
 }
 
 

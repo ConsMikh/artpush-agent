@@ -19,6 +19,7 @@ from artpush_cli.commands import (
     UsageError,
     admin,
     archive,
+    artist,
     artnow,
     bulk,
     catalogs,
@@ -53,6 +54,7 @@ COMMAND_MODULES = [
     artnow,
     archive,
     admin,
+    artist,
     publish,
     report,
 ]

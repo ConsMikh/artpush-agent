@@ -908,12 +908,8 @@ VK_STATES = {
     "none": "ключ не проверялся",
     "ok": "ключ принят, сообщество доступно",
     "rejected": "VK не принял ключ — запишите новый (publish account secret set)",
-    "no_rights": "у ключа нет нужных прав сообщества",
+    "no_rights": "у ключа нет права «Стена»",
     "not_found": "сообщество не найдено — проверьте поле «Сообщество»",
-    "no_messages": (
-        "в сообществе выключены сообщения или у ключа нет права «Сообщения сообщества»"
-        " — VK не даёт загрузить фото"
-    ),
     "wrong_group": "ключ выдан другому сообществу — создайте ключ в настройках этого сообщества",
     "closed": "VK закрыл этот путь — публикуйте пакетом",
     "down": "VK сейчас не отвечает — повторите проверку позже",
@@ -929,27 +925,26 @@ def _vk_state_line(account: dict) -> str:
     return f"VK{' ' + name if name else ''}: {text}"
 
 
+IG_CONNECT_HINT = "Настройки → Площадки → Подключить Instagram"
+IG_CONNECT = f"человек подключает Instagram сам: «{IG_CONNECT_HINT}»"
 INSTAGRAM_STATES = {
     "none": "ключ не проверялся",
     "ok": "работает",
-    "wrong_account": "ключ выдан другому профилю — создайте ключ для этого профиля",
+    "wrong_account": "ключ выдан другому профилю — подключите нужный профиль заново",
     "personal": "профиль личный — нужен «Автор» или «Бизнес»",
-    "expired": "ключ истёк — запишите новый (publish account secret set)",
-    "rejected": "Instagram не принял ключ — запишите новый (publish account secret set)",
-    "not_found": "не указан профиль Instagram — заполните поле «Профиль» аккаунта",
-    "no_rights": "у ключа нет права публиковать в Instagram — создайте ключ с этим правом",
+    "expired": f"ключ истёк — {IG_CONNECT}",
+    "rejected": f"Instagram не принял ключ — {IG_CONNECT}",
+    "not_found": f"профиль Instagram не определён — {IG_CONNECT}",
+    "no_rights": f"у ключа нет права публиковать — {IG_CONNECT}, разрешив всё запрошенное",
     "no_egress": "нет выхода к Instagram — настройте его у администратора",
     "down": "Instagram сейчас не отвечает — повторите проверку позже",
-    "no_key": "ключа нет — человек вводит его: publish account secret set",
+    "no_key": f"ключа нет — {IG_CONNECT}",
 }
 IG_TYPES = {"MEDIA_CREATOR": "Автор", "BUSINESS": "Бизнес", "PERSONAL": "Личный"}
-KEY_PROMPTS = {
-    "vk": "Ключ сообщества VK (ввод скрыт): ",
-    "instagram": "Ключ Instagram (ввод скрыт): ",
-}
+KEY_PROMPTS = {"vk": "Ключ сообщества VK (ввод скрыт): "}
 KEY_ERASE = {
     "vk": "Стереть ключ сообщества VK у аккаунта {pk}? Выгрузка на стену перейдёт на пакет.",
-    "instagram": "Стереть ключ Instagram у аккаунта {pk}? Выгрузка в Instagram перейдёт на пакет.",
+    "instagram": "Отключить Instagram у аккаунта {pk}? Выгрузка в Instagram перейдёт на пакет.",
 }
 
 
@@ -987,6 +982,11 @@ def _key_account(ctx: Context, value: str) -> tuple[int, str]:
 
 def _vk_key_set(args, ctx: Context) -> None:
     pk, platform = _key_account(ctx, args.id)
+    if platform == "instagram":
+        raise CommandError(
+            f"Ключ Instagram вручную не вводится: человек открывает «{IG_CONNECT_HINT}»",
+            "manual_key_removed",
+        )
     value = read_secret(KEY_PROMPTS.get(platform, "Ключ (ввод скрыт): "), args.from_file)
     try:
         with masked(value):
@@ -1237,12 +1237,14 @@ def _register_accounts(pub, parents: list) -> None:
 
     secret = actions.add_parser(
         "secret",
-        help="Ключ сообщества VK или Instagram: вводит человек",
-        description="Ключ сообщества VK или ключ Instagram",
+        help="Ключ сообщества VK: вводит человек (Instagram подключается кнопкой)",
+        description="Ключ сообщества VK; Instagram подключается кнопкой в «Настройки → Площадки»",
     )
     secrets = secret.add_subparsers(dest="secret_action", metavar="действие")
-    put = command(secrets, "set", "Записать ключ: скрытый ввод в терминале или файл", parents)
-    put.add_argument("id", help="номер аккаунта или цель (vk:vk, instagram:ru)")
+    put = command(
+        secrets, "set", "Записать ключ сообщества VK: скрытый ввод в терминале или файл", parents
+    )
+    put.add_argument("id", help="номер аккаунта или цель (vk:vk)")
     put.add_argument("--from-file", help="файл с ключом (UTF-8); без него — скрытый ввод")
     put.set_defaults(handler=_vk_key_set, mutates=lambda a: True)
     wipe = command(secrets, "delete", "Стереть ключ (выгрузка перейдёт на пакет)", parents)
